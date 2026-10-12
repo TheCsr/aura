@@ -2,7 +2,8 @@
 
 from datetime import datetime, timezone
 import os
-from typing import Any, Callable, List, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence
 from uuid import uuid4
 
 import pika
@@ -13,6 +14,31 @@ from .application import ValidatedSensorEventPublisher
 
 
 DEFAULT_URL = "amqp://guest:guest@localhost:5672/"
+
+PRESETS: Mapping[str, Mapping[str, Any]] = {
+    "Normal": {"temperature_c": 18.0, "humidity_pct": 45.0, "door_state": "closed", "motion_detected": True},
+    "Door open, no motion": {"temperature_c": 18.0, "humidity_pct": 45.0, "door_state": "open", "motion_detected": False},
+    "Critical cold": {"temperature_c": -20.0, "humidity_pct": 45.0, "door_state": "open", "motion_detected": False},
+    "Hot and humid": {"temperature_c": 46.0, "humidity_pct": 96.0, "door_state": "closed", "motion_detected": True},
+}
+
+
+def load_env_file(path: Path, environment: Optional[MutableMapping[str, str]] = None) -> None:
+    """Load KEY=VALUE lines from a .env file; variables already set are kept."""
+
+    target = os.environ if environment is None else environment
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key:
+            target.setdefault(key, value)
 
 
 def manual_input_settings(environment: Optional[Mapping[str, str]] = None) -> LavinMQSettings:

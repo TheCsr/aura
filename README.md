@@ -9,24 +9,24 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## Sensor input UI (local testing)
 
-A Streamlit page for entering sensor values and publishing them to LavinMQ,
-instead of using the terminal. It runs on your own machine only:
-**http://localhost:8501**.
+One command, no other terminals:
 
 ```bash
-# Which broker? Default is a local LavinMQ (amqp://guest:guest@localhost:5672/).
-# For a shared/hosted broker, put LAVINMQ_URL='amqps://...' in .env (git-ignored) and load it:
-set -a; source .env; set +a
-
-# terminal 1: the page
-.venv/bin/streamlit run aura/sensors/ui.py
-
-# terminal 2: the consumer that runs the agents on each published reading
-.venv/bin/python -m aura.streaming.demo consume
+./start-sensor-ui.sh
 ```
 
-The consumer needs `LAVINMQ_URL` set, even for the local broker:
-`export LAVINMQ_URL=amqp://guest:guest@localhost:5672/`.
+The first run creates `.venv` and installs requirements. Every run opens
+**http://localhost:8501** (this machine only). The page:
+
+- reads `LAVINMQ_URL` from `.env` (git-ignored). Without it, it uses a local LavinMQ
+  (`amqp://guest:guest@localhost:5672/`). For a shared broker, put one line in `.env`:
+  `LAVINMQ_URL='amqps://user:pass@host.lmq.cloudamqp.com/vhost'`
+- starts the agents' consumer automatically. Stop and start it from the sidebar to watch
+  readings wait in the queue.
+- **🧪 Run automatic test** publishes every preset through LavinMQ and checks each outcome
+  (normal → no action; door open, critical cold, hot and humid → ticket created; 500 °C → blocked).
+- lets you enter a reading by hand and shows the agents' results live.
 
 The page publishes to exchange `aura.events`, routing key `sensor.event`, and queue
-`aura.sensor.events`. The **Broker** section on the page shows which broker it is using.
+`aura.sensor.events`. Don't also run `python -m aura.streaming.demo consume` against the
+same broker: two consumers on one queue split the messages.

@@ -1,5 +1,7 @@
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from aura.graph import WorkflowOutcome
 from aura.messaging.codec import EventMessageCodec
@@ -82,6 +84,62 @@ class StreamingDemoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing required sensor"):
             demo.service.handle(event)
         self.assertEqual(demo.dashboard.records, ())
+
+    def test_run_command_executes_offline_scenario(self):
+        import contextlib
+        import io
+        from aura.streaming.demo import main
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = main(["run", "--scenario", "critical-cold"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn('"outcome": "dispatched"', output)
+        self.assertIn("Dashboard records created: 1", output)
+
+    def test_publish_command_sends_terminal_sensor_readings(self):
+        from aura.streaming.demo import main
+
+        publishers = []
+
+        class PublisherSpy:
+            def __init__(self, settings):
+                self.events = []
+                publishers.append(self)
+
+            def publish(self, event):
+                self.events.append(event)
+
+            def close(self):
+                pass
+
+        with patch("aura.streaming.demo.LavinMQSettings.from_environment", return_value=SimpleNamespace(queue="aura.sensor.events")), patch(
+            "aura.streaming.demo.PikaLavinMQPublisher", PublisherSpy
+        ):
+            exit_code = main([
+                "publish",
+                "--temperature-c", "21.5",
+                "--humidity-pct", "42",
+                "--door-state", "open",
+                "--motion-detected", "false",
+                "--subject-id", "resident-7",
+                "--source", "hallway-sensor",
+                "--event-id", "reading-123",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        sent_event = publishers[0].events[0]
+        self.assertEqual(sent_event.event_id, "reading-123")
+        self.assertEqual(sent_event.source, "hallway-sensor")
+        self.assertEqual(sent_event.subject_id, "resident-7")
+        self.assertEqual(sent_event.observations, {
+            "temperature_c": 21.5,
+            "humidity_pct": 42.0,
+            "door_state": "open",
+            "motion_detected": False,
+        })
 
 
 if __name__ == "__main__":

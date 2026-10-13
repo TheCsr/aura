@@ -75,6 +75,37 @@ class TriageAgentTests(unittest.TestCase):
         self.assertIn("untrusted data", model.calls[0][0])
         self.assertIn("kb-whisper", model.calls[0][1])
 
+    def test_agent_retries_once_when_model_cites_unknown_evidence(self):
+        class RetryingChatModel:
+            def __init__(self):
+                self.responses = [
+                    model_response(evidence_refs=["supervisor.evidence.99"]),
+                    model_response(),
+                ]
+                self.calls = []
+
+            def complete(self, *, system_prompt, user_prompt):
+                self.calls.append((system_prompt, json.loads(user_prompt)))
+                return self.responses.pop(0)
+
+        event = make_event()
+        model = RetryingChatModel()
+        proposal = TriageAgent(model)(event, make_assessment(event))
+
+        self.assertEqual(proposal.evidence_refs, ("supervisor.evidence.0",))
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.calls[0][1]["allowed_evidence_refs"], ["supervisor.evidence.0"])
+        self.assertIn("correction", model.calls[1][1])
+
+    def test_agent_still_rejects_unknown_evidence_after_one_retry(self):
+        class InvalidReferenceChatModel:
+            def complete(self, *, system_prompt, user_prompt):
+                return model_response(evidence_refs=["supervisor.evidence.99"])
+
+        event = make_event()
+        with self.assertRaisesRegex(ValueError, "unknown evidence"):
+            TriageAgent(InvalidReferenceChatModel())(event, make_assessment(event))
+
     def test_agent_rejects_normal_assessment_without_calling_model(self):
         event = make_event()
         assessment = Assessment(

@@ -10,11 +10,12 @@ from urllib.parse import urlparse
 class LavinMQSettings:
     url: str = field(repr=False)
     exchange: str = "aura.events"
-    queue: str = "aura.sensor.events"
+    queue: str = "aura.sensor.events.v2"
     routing_key: str = "sensor.event"
     prefetch_count: int = 10
-    dead_letter_exchange: Optional[str] = None
-    dead_letter_routing_key: Optional[str] = None
+    dead_letter_exchange: str = "aura.events.dead"
+    dead_letter_queue: Optional[str] = None
+    dead_letter_routing_key: str = "sensor.event.failed"
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.url)
@@ -33,8 +34,16 @@ class LavinMQSettings:
             or self.prefetch_count < 1
         ):
             raise ValueError("prefetch_count must be a positive integer")
-        if self.dead_letter_routing_key and not self.dead_letter_exchange:
-            raise ValueError("dead_letter_exchange is required with dead_letter_routing_key")
+        for name, value in (
+            ("dead_letter_exchange", self.dead_letter_exchange),
+            ("dead_letter_routing_key", self.dead_letter_routing_key),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if self.dead_letter_queue is not None and (
+            not isinstance(self.dead_letter_queue, str) or not self.dead_letter_queue.strip()
+        ):
+            raise ValueError("dead_letter_queue must be a non-empty string when provided")
 
     @classmethod
     def from_environment(
@@ -52,9 +61,14 @@ class LavinMQSettings:
         return cls(
             url=url,
             exchange=values.get("LAVINMQ_EXCHANGE", "aura.events"),
-            queue=values.get("LAVINMQ_QUEUE", "aura.sensor.events"),
+            queue=values.get("LAVINMQ_QUEUE", "aura.sensor.events.v2"),
             routing_key=values.get("LAVINMQ_ROUTING_KEY", "sensor.event"),
             prefetch_count=prefetch_count,
-            dead_letter_exchange=values.get("LAVINMQ_DEAD_LETTER_EXCHANGE") or None,
-            dead_letter_routing_key=values.get("LAVINMQ_DEAD_LETTER_ROUTING_KEY") or None,
+            dead_letter_exchange=values.get(
+                "LAVINMQ_DEAD_LETTER_EXCHANGE", "aura.events.dead"
+            ),
+            dead_letter_queue=values.get("LAVINMQ_DEAD_LETTER_QUEUE") or None,
+            dead_letter_routing_key=values.get(
+                "LAVINMQ_DEAD_LETTER_ROUTING_KEY", "sensor.event.failed"
+            ),
         )

@@ -10,6 +10,7 @@ from .agents.supervisor_llm import LlmAssessmentStrategy
 from .agents.triage import TriageAgent
 from .contracts import InputEvent, JsonValue
 from .graph import WorkflowState, build_agent_graph, initial_workflow_state
+from .llm import llm_from_environment
 from .ports import ActionPolicy, ActionTool, BaselineStore, ChatModel
 from .testing import (
     DeterministicFakeAssessmentChatModel,
@@ -55,19 +56,25 @@ def create_demo_system(
     if baseline_store is not None and baselines is not None:
         raise ValueError("provide either baselines or baseline_store, not both")
 
+    real_llm = llm_from_environment()
     selected_baseline_store = (
         baseline_store
         if baseline_store is not None
         else InMemoryBaselineStore(baselines)
     )
-    selected_chat_model = chat_model if chat_model is not None else DeterministicFakeChatModel()
+    selected_chat_model = (
+        chat_model
+        if chat_model is not None
+        else real_llm or DeterministicFakeChatModel()
+    )
     selected_assessment_strategy = (
         supervisor_strategy
         if supervisor_strategy is not None
         else LlmAssessmentStrategy(
             assessment_model
             if assessment_model is not None
-            else DeterministicFakeAssessmentChatModel(numeric_tolerances=numeric_tolerances),
+            else real_llm
+            or DeterministicFakeAssessmentChatModel(numeric_tolerances=numeric_tolerances),
             numeric_tolerances=numeric_tolerances,
         )
     )

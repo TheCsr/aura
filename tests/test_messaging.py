@@ -157,7 +157,17 @@ class LavinMQSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.queue, "sensor-events")
         self.assertEqual(settings.prefetch_count, 3)
+        self.assertEqual(settings.dead_letter_exchange, "aura.dead")
+        self.assertEqual(settings.dead_letter_queue, None)
+        self.assertEqual(settings.dead_letter_routing_key, "sensor.event.failed")
         self.assertNotIn("secret", repr(settings))
+
+    def test_default_queue_is_versioned_for_dead_letter_topology_migration(self):
+        settings = LavinMQSettings.from_environment({
+            "LAVINMQ_URL": "amqps://user:secret@broker.example/vhost",
+        })
+
+        self.assertEqual(settings.queue, "aura.sensor.events.v2")
 
     def test_requires_valid_url_and_prefetch_count(self):
         with self.assertRaisesRegex(ValueError, "LAVINMQ_URL"):
@@ -202,13 +212,47 @@ class PikaLavinMQPublisherTests(unittest.TestCase):
         publisher.connect()
 
         channel = factory.connections[0].channel_instance
+        self.assertIn(
+            ("exchange_declare", {
+                "exchange": "aura.dead",
+                "exchange_type": "direct",
+                "durable": True,
+            }),
+            channel.calls,
+        )
+        self.assertIn(
+            ("queue_declare", {"queue": "test.sensor.events.dead", "durable": True}),
+            channel.calls,
+        )
+        self.assertIn(
+            ("queue_bind", {
+                "exchange": "aura.dead",
+                "queue": "test.sensor.events.dead",
+                "routing_key": "bad.event",
+            }),
+            channel.calls,
+        )
+        primary_queue_declare = next(
+            kwargs
+            for call_name, kwargs in channel.calls
+            if call_name == "queue_declare" and kwargs.get("queue") == "test.sensor.events"
+        )
         self.assertEqual(
-            get_call(channel, "queue_declare")["arguments"],
+            primary_queue_declare["arguments"],
             {
                 "x-dead-letter-exchange": "aura.dead",
                 "x-dead-letter-routing-key": "bad.event",
             },
         )
+
+    def test_default_settings_configure_a_durable_dead_letter_route(self):
+        settings = LavinMQSettings.from_environment({
+            "LAVINMQ_URL": "amqps://user:secret@broker.example/vhost",
+        })
+
+        self.assertEqual(settings.dead_letter_exchange, "aura.events.dead")
+        self.assertEqual(settings.dead_letter_queue, None)
+        self.assertEqual(settings.dead_letter_routing_key, "sensor.event.failed")
 
 
 class PikaLavinMQConsumerTests(unittest.TestCase):
@@ -251,6 +295,40 @@ class PikaLavinMQConsumerTests(unittest.TestCase):
         self.assertIn(
             ("basic_nack", {"delivery_tag": 7, "requeue": False}),
             self.channel.calls,
+        )
+
+    def test_default_consumer_topology_binds_a_durable_dead_letter_queue(self):
+        self.assertIn(
+            ("exchange_declare", {
+                "exchange": "aura.events.dead",
+                "exchange_type": "direct",
+                "durable": True,
+            }),
+            self.channel.calls,
+        )
+        self.assertIn(
+            ("queue_declare", {"queue": "test.sensor.events.dead", "durable": True}),
+            self.channel.calls,
+        )
+        self.assertIn(
+            ("queue_bind", {
+                "exchange": "aura.events.dead",
+                "queue": "test.sensor.events.dead",
+                "routing_key": "sensor.event.failed",
+            }),
+            self.channel.calls,
+        )
+        primary_queue = next(
+            kwargs
+            for call_name, kwargs in self.channel.calls
+            if call_name == "queue_declare" and kwargs.get("queue") == "test.sensor.events"
+        )
+        self.assertEqual(
+            primary_queue["arguments"],
+            {
+                "x-dead-letter-exchange": "aura.events.dead",
+                "x-dead-letter-routing-key": "sensor.event.failed",
+            },
         )
 
     def test_nacks_handler_failure_and_mismatched_message_id(self):

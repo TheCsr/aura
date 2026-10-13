@@ -4,8 +4,8 @@ import argparse
 from datetime import datetime, timezone
 import json
 import logging
-import math
-import time
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 from uuid import uuid4
 
@@ -48,6 +48,41 @@ def make_sensor_event(scenario: str, *, event_id: Optional[str] = None) -> Input
         source="synthetic-sensor-publisher",
         observations=observations,
     )
+
+
+def make_terminal_sensor_event(args: argparse.Namespace) -> InputEvent:
+    """Build an event from readings explicitly supplied by a sensor operator."""
+    observations: Dict[str, Any] = {
+        "temperature_c": args.temperature_c,
+        "humidity_pct": args.humidity_pct,
+        "door_state": args.door_state,
+        "motion_detected": args.motion_detected == "true",
+    }
+    return InputEvent(
+        event_id=args.event_id or f"sensor-{uuid4().hex}",
+        occurred_at=datetime.now(timezone.utc),
+        subject_id=args.subject_id,
+        source=args.source,
+        observations=observations,
+    )
+
+
+def _load_dotenv_if_present() -> None:
+    """Load unset environment values from the repository .env without displaying them."""
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, value = stripped.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if name and name not in os.environ:
+            os.environ[name] = value
 
 
 def result_as_json(result: StreamingResult) -> str:
@@ -124,48 +159,76 @@ def _consume() -> None:
 
 
 def _publish(args: argparse.Namespace) -> None:
-    if not math.isfinite(args.interval) or args.interval < 0:
-        raise ValueError("--interval must be a finite, non-negative number")
     settings = LavinMQSettings.from_environment()
     publisher = PikaLavinMQPublisher(settings)
     validated_publisher = ValidatedSensorEventPublisher(publisher)
+    event = make_terminal_sensor_event(args)
     try:
-        for index in range(args.count):
-            event = make_sensor_event(args.scenario)
-            validated_publisher.publish(event)
-            print(
-                json.dumps(
-                    {
-                        "published_event_id": event.event_id,
-                        "scenario": args.scenario,
-                        "sequence": index + 1,
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-            if index + 1 < args.count and args.interval:
-                time.sleep(args.interval)
+        validated_publisher.publish(event)
+        print(
+            json.dumps(
+                {
+                    "published_event_id": event.event_id,
+                    "source": event.source,
+                    "subject_id": event.subject_id,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "observations": dict(event.observations),
+                    "broker_queue": settings.queue,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            flush=True,
+        )
     finally:
         publisher.close()
 
 
+def _run(args: argparse.Namespace) -> None:
+    demo = create_streaming_demo(resident_response=args.resident_response)
+    event = make_sensor_event(args.scenario)
+    result = demo.service.handle(event)
+    print(result_as_json(result), flush=True)
+    if result.receipt is not None:
+        print(
+            f"Dashboard records created: {len(demo.dashboard.records)}",
+            flush=True,
+        )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the AURA LavinMQ streaming demo.")
+    parser = argparse.ArgumentParser(description="Send sensor events through the AURA streaming pipeline.")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("consume", help="consume and process sensor events")
-    publish_parser = commands.add_parser("publish", help="publish synthetic sensor events")
-    publish_parser.add_argument("--scenario", choices=SCENARIOS, default="critical-cold")
-    publish_parser.add_argument("--count", type=int, default=1)
-    publish_parser.add_argument("--interval", type=float, default=2.0)
+    commands.add_parser("consume", help="consume and process sensor events via LavinMQ")
+    publish_parser = commands.add_parser(
+        "publish",
+        help="publish real sensor readings supplied as command-line values to LavinMQ",
+    )
+    publish_parser.add_argument("--temperature-c", type=float, required=True)
+    publish_parser.add_argument("--humidity-pct", type=float, required=True)
+    publish_parser.add_argument("--door-state", choices=("open", "closed", "unknown"), required=True)
+    publish_parser.add_argument("--motion-detected", choices=("true", "false"), required=True)
+    publish_parser.add_argument("--subject-id", default=DEFAULT_SUBJECT_ID)
+    publish_parser.add_argument("--source", default="terminal-sensor")
+    publish_parser.add_argument("--event-id")
+
+    run_parser = commands.add_parser("run", help="run a sensor scenario locally without a broker")
+    run_parser.add_argument("--scenario", choices=SCENARIOS, default="critical-cold")
+    run_parser.add_argument(
+        "--resident-response",
+        default="Jag är okej, men jag vill gärna prata med personalen.",
+        help="transcript text returned by mock STT for resident voice check",
+    )
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _load_dotenv_if_present()
     if args.command == "consume":
         _consume()
+    elif args.command == "run":
+        _run(args)
     else:
-        if args.count < 1:
-            parser.error("--count must be at least 1")
         _publish(args)
     return 0
 

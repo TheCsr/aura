@@ -140,12 +140,15 @@ class TriagePromptBuilder:
             "If information is insufficient, propose a human review. Return only a JSON object with "
             "exactly these keys: action_type, rationale, confidence, parameters, evidence_refs. "
             "confidence must be a number from 0 to 1, parameters must be a JSON object, and "
-            "evidence_refs must cite supplied evidence references."
+            "evidence_refs must contain only exact strings from allowed_evidence_refs. Never invent, "
+            "rewrite, or infer an evidence reference."
         )
+        context = json.loads(evidence.context_json)
         user_prompt = json.dumps(
             {
                 "allowed_action_types": list(allowed_action_types),
-                "context": json.loads(evidence.context_json),
+                "allowed_evidence_refs": list(evidence.evidence_refs),
+                "context": context,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -274,11 +277,38 @@ class TriageAgent:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
+        proposal_id = self._proposal_id_factory()
+        try:
+            return self._output_parser.parse(
+                response,
+                event=event,
+                evidence_refs=evidence.evidence_refs,
+                proposal_id=proposal_id,
+                allowed_action_types=self._allowed_action_types,
+            )
+        except ValueError as error:
+            if str(error) != "Triage response cites unknown evidence":
+                raise
+
+        repair_payload = json.loads(user_prompt)
+        repair_payload["correction"] = (
+            "The previous evidence_refs were invalid. Return a corrected proposal using only "
+            "exact strings from allowed_evidence_refs."
+        )
+        repaired_response = self._chat_model.complete(
+            system_prompt=system_prompt,
+            user_prompt=json.dumps(
+                repair_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
         return self._output_parser.parse(
-            response,
+            repaired_response,
             event=event,
             evidence_refs=evidence.evidence_refs,
-            proposal_id=self._proposal_id_factory(),
+            proposal_id=proposal_id,
             allowed_action_types=self._allowed_action_types,
         )
 

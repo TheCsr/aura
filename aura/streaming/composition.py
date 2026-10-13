@@ -7,6 +7,7 @@ from ..agents.critical_risk_policy import CriticalRiskPolicy
 from ..agents.dispatcher import ActionToolRegistry, DispatcherAgent
 from ..agents.guardian import GuardianAgent
 from ..agents.supervisor import SupervisorAgent
+from ..llm import llm_from_environment
 from ..agents.supervisor_llm import LlmAssessmentStrategy
 from ..agents.triage import TriageAgent
 from ..contracts import JsonValue
@@ -46,9 +47,10 @@ def create_streaming_demo(
         {DEFAULT_SUBJECT_ID: dict(DEFAULT_BASELINE)} if baselines is None else baselines
     )
     baseline_store = InMemoryBaselineStore(selected_baselines)
+    real_llm = llm_from_environment()
     supervisor = SupervisorAgent(
         baseline_store,
-        strategy=LlmAssessmentStrategy(DeterministicFakeAssessmentChatModel()),
+        strategy=LlmAssessmentStrategy(real_llm or DeterministicFakeAssessmentChatModel()),
     )
     voice_responder = ScriptedVoiceResponder(
         speaker=MockSpeaker(),
@@ -56,7 +58,7 @@ def create_streaming_demo(
         transcriber=FakeSpeechToTextAdapter(resident_response),
         signal_analyzer=PcmWavSignalAnalyzer(),
     )
-    triage = TriageAgent(DeterministicFakeChatModel())
+    triage = TriageAgent(real_llm or DeterministicFakeChatModel())
     guardian = GuardianAgent(policy=guardian_policy or CriticalRiskPolicy())
     dashboard = MockDashboardAdapter()
     dispatcher = DispatcherAgent(ActionToolRegistry({"request_human_review": dashboard}))

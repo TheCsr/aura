@@ -23,14 +23,23 @@ def _declare_topology(channel: Any, settings: LavinMQSettings) -> None:
     )
     dead_letter_arguments = None
     if settings.dead_letter_exchange:
+        dead_letter_queue = settings.dead_letter_queue or f"{settings.queue}.dead"
+        dead_letter_routing_key = (
+            settings.dead_letter_routing_key or settings.routing_key
+        )
         channel.exchange_declare(
             exchange=settings.dead_letter_exchange,
             exchange_type="direct",
             durable=True,
         )
+        channel.queue_declare(queue=dead_letter_queue, durable=True)
+        channel.queue_bind(
+            exchange=settings.dead_letter_exchange,
+            queue=dead_letter_queue,
+            routing_key=dead_letter_routing_key,
+        )
         dead_letter_arguments = {"x-dead-letter-exchange": settings.dead_letter_exchange}
-        if settings.dead_letter_routing_key:
-            dead_letter_arguments["x-dead-letter-routing-key"] = settings.dead_letter_routing_key
+        dead_letter_arguments["x-dead-letter-routing-key"] = dead_letter_routing_key
     channel.queue_declare(
         queue=settings.queue,
         durable=True,

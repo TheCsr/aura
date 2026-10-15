@@ -5,7 +5,7 @@ import math
 from threading import RLock
 from typing import Dict, Mapping, Optional
 
-from .contracts import JsonValue
+from .contracts import ActionType, JsonValue
 from .ports import BaselineStore
 
 
@@ -90,6 +90,7 @@ class DeterministicFakeChatModel:
         rationale: str = "Requesting a human review of the supplied evidence.",
         confidence: float = 0.85,
         parameters: Optional[Mapping[str, JsonValue]] = None,
+        scripted_responses: Optional[Mapping[str, Mapping[str, JsonValue]]] = None,
     ) -> None:
         if action_type is not None and (not isinstance(action_type, str) or not action_type.strip()):
             raise ValueError("action_type must be a non-empty string when provided")
@@ -116,6 +117,11 @@ class DeterministicFakeChatModel:
         self._action_type = action_type
         self._rationale = rationale
         self._confidence = float(confidence)
+        self._scripted_responses: Dict[str, Dict[str, JsonValue]] = {}
+        for stage, response in (scripted_responses or {}).items():
+            if stage not in {"initial", "post_reply"}:
+                raise ValueError("scripted response stages must be initial or post_reply")
+            self._scripted_responses[stage] = _copy_json_object(response, f"{stage} response")
 
     def complete(self, *, system_prompt: str, user_prompt: str) -> str:
         try:
@@ -133,10 +139,11 @@ class DeterministicFakeChatModel:
             or any(not isinstance(action, str) or not action.strip() for action in allowed_action_types)
         ):
             raise ValueError("prompt must provide non-empty allowed_action_types")
+        if self._action_type is not None and self._action_type not in allowed_action_types:
+            raise ValueError("configured fake action_type is not allowed by the prompt")
         if not isinstance(context, dict):
             raise ValueError("prompt must provide a context object")
 
-        action_type = self._choose_action(allowed_action_types)
         assessment = context.get("supervisor_assessment")
         if not isinstance(assessment, dict):
             raise ValueError("prompt context must include a Supervisor assessment")
@@ -150,14 +157,59 @@ class DeterministicFakeChatModel:
         if not isinstance(evidence_ref, str) or not evidence_ref:
             raise ValueError("first Supervisor evidence entry must have a reference")
 
+        event = context.get("event")
+        if not isinstance(event, dict):
+            raise ValueError("prompt context must include an event object")
+        transcript = event.get("transcript")
+        stage = "post_reply" if isinstance(transcript, dict) else "initial"
+        scripted = self._scripted_responses.get(stage, {})
+        action_type = scripted.get("action_type", self._choose_stage_action(allowed_action_types, stage))
+        rationale = scripted.get("rationale", self._default_rationale(transcript, stage))
+        confidence = scripted.get("confidence", self._confidence)
+        parameters = scripted.get("parameters", self._parameters)
+        if not isinstance(parameters, dict):
+            raise ValueError("scripted parameters must be a JSON object")
+        if stage == "initial" and action_type == ActionType.ASK_RESIDENT.value:
+            parameters = dict(parameters)
+            parameters.setdefault("question_sv", "Är allt bra hemma?")
+
+        evidence_refs = [evidence_ref]
+        reply_evidence_ref = context.get("resident_reply_evidence_ref")
+        if (
+            prompt.get("reply_citation_required") is True
+            and isinstance(reply_evidence_ref, str)
+            and reply_evidence_ref not in evidence_refs
+        ):
+            evidence_refs.append(reply_evidence_ref)
+
         response = {
             "action_type": action_type,
-            "rationale": self._rationale,
-            "confidence": self._confidence,
-            "parameters": self._parameters,
-            "evidence_refs": [evidence_ref],
+            "rationale": rationale,
+            "confidence": confidence,
+            "parameters": parameters,
+            "evidence_refs": scripted.get("evidence_refs", evidence_refs),
         }
         return json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+    def _choose_stage_action(self, allowed_action_types: list[str], stage: str) -> str:
+        if self._action_type is not None:
+            return self._choose_action(allowed_action_types)
+        preferred = (
+            ActionType.ASK_RESIDENT.value
+            if stage == "initial"
+            else ActionType.REMOTE_FOLLOWUP.value
+        )
+        if preferred in allowed_action_types:
+            return preferred
+        return self._choose_action(allowed_action_types)
+
+    def _default_rationale(self, transcript: object, stage: str) -> str:
+        if stage == "post_reply" and isinstance(transcript, dict):
+            text = transcript.get("text")
+            if isinstance(text, str) and text.strip():
+                quote = text.strip()[:80]
+                return f'Residenten svarade "{quote}", vilket motiverar uppföljning.'
+        return self._rationale
 
     def _choose_action(self, allowed_action_types: list[str]) -> str:
         if self._action_type is not None:
@@ -207,8 +259,22 @@ class DeterministicFakeAssessmentChatModel:
             if differs:
                 changed_fields.append(field)
 
+        observations = context.get("observations", {})
+        temperature = observations.get("temperature_c")
+        humidity = observations.get("humidity_pct")
+        door_state = observations.get("door_state")
+        motion_detected = observations.get("motion_detected")
+        critical = (
+            isinstance(temperature, (int, float)) and not isinstance(temperature, bool)
+            and (temperature <= -10.0 or temperature >= 45.0)
+        ) or (
+            isinstance(humidity, (int, float)) and not isinstance(humidity, bool)
+            and (humidity <= 5.0 or humidity >= 95.0)
+        ) or (door_state == "open" and motion_detected is False)
+
         payload = {
             "is_anomaly": bool(changed_fields),
+            "severity": "critical" if critical and changed_fields else "moderate" if changed_fields else "info",
             "summary": (
                 f"{len(changed_fields)} sensor field(s) differ from baseline."
                 if changed_fields

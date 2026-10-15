@@ -1,14 +1,17 @@
 """FastAPI backend server for the AURA React Dashboard."""
 
 import base64
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+from math import isfinite
 import os
 from pathlib import Path
-from threading import Lock, Thread
-from typing import Any, Dict, List, Optional
+from statistics import median
+from threading import Event, Lock, Thread
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
@@ -47,11 +50,10 @@ from aura.messaging.adapters.lavinmq import (
     PikaLavinMQPublisher,
 )
 from aura.messaging.codec import EventMessageCodec
-from aura.sensors.application import ValidatedSensorEventHandler, ValidatedSensorEventPublisher
+from aura.sensors.application import ValidatedSensorEventPublisher
 from aura.streaming.composition import DEFAULT_SUBJECT_ID, create_streaming_demo
 from aura.streaming.demo import make_sensor_event, result_as_json
 from aura.streaming.service import StreamingResult
-from aura.voice.adapters.fake_stt import FakeSpeechToTextAdapter
 from aura.voice.adapters.google_tts import GoogleTranslateTtsAdapter
 from aura.voice.adapters.orange_kb_whisper import OrangeKbWhisperAdapter
 from aura.voice.adapters.wav_signal_analyzer import PcmWavSignalAnalyzer
@@ -63,9 +65,11 @@ logger = logging.getLogger("aura.dashboard.server")
 @asynccontextmanager
 async def _dashboard_lifespan(_app: FastAPI):
     _start_broker_consumer()
+    _start_expiry_sweeper()
     try:
         yield
     finally:
+        _stop_expiry_sweeper()
         _stop_broker_consumer()
 
 
@@ -90,20 +94,43 @@ _processed_results: List[StreamingResult] = []
 _latest_result: Optional[StreamingResult] = None
 _tickets_meta: Dict[str, Dict[str, Any]] = {}
 _event_sensor_data: Dict[str, Dict[str, Any]] = {}
+_ticket_feedback: Dict[str, Dict[str, Any]] = {}
+_baseline_suggestions: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_buddy_requests: List[Dict[str, Any]] = []
+_FALSE_ALARM_SUGGESTION_THRESHOLD = 3
+_SYNTHETIC_BUDDIES = (
+    {
+        "buddy_id": "demo-companion-anna",
+        "name": "Demo Companion Anna",
+        "relationship": "Daughter",
+        "nda_signed": True,
+        "description": "A friendly conversation about everyday life, hobbies, or how your day is going.",
+        "language": "Swedish",
+        "synthetic": True,
+    },
+    {
+        "buddy_id": "demo-companion-erik",
+        "name": "Demo Companion Erik",
+        "relationship": "Son",
+        "nda_signed": True,
+        "description": "A calm conversation partner for a friendly chat and company.",
+        "language": "Swedish",
+        "synthetic": True,
+    },
+)
 
-# Active prompt for the Resident Device
-_active_prompt: Optional[Dict[str, Any]] = None
-_pending_device_event: Optional[InputEvent] = None
 _google_tts = GoogleTranslateTtsAdapter(default_language="sv")
 _kb_whisper = OrangeKbWhisperAdapter()
 _signal_analyzer = PcmWavSignalAnalyzer()
 _broker_consumer: Optional[PikaLavinMQConsumer] = None
 _broker_consumer_thread: Optional[Thread] = None
+_expiry_sweeper_stop = Event()
+_expiry_sweeper_thread: Optional[Thread] = None
 
 
 def _handle_broker_event(event: InputEvent) -> StreamingResult:
     with _state_lock:
-        result = _demo.service.handle(event)
+        result = _demo.service.start(event)
         _record_result(result, event)
         return result
 
@@ -120,7 +147,7 @@ def _start_broker_consumer() -> None:
 
     _broker_consumer = PikaLavinMQConsumer(
         settings,
-        ValidatedSensorEventHandler(_handle_broker_event),
+        _handle_broker_event,
     )
     _broker_consumer_thread = Thread(
         target=_broker_consumer.run_forever,
@@ -141,6 +168,41 @@ def _stop_broker_consumer() -> None:
     _broker_consumer_thread = None
 
 
+def _sweep_expired_conversations() -> None:
+    with _state_lock:
+        for result in _demo.service.sweep_expired_conversations():
+            _record_result(result)
+
+
+def _run_expiry_sweeper() -> None:
+    while not _expiry_sweeper_stop.wait(1.0):
+        try:
+            _sweep_expired_conversations()
+        except Exception:
+            logger.error("Pending-conversation escalation sweep failed")
+
+
+def _start_expiry_sweeper() -> None:
+    global _expiry_sweeper_thread
+    if _expiry_sweeper_thread is not None and _expiry_sweeper_thread.is_alive():
+        return
+    _expiry_sweeper_stop.clear()
+    _expiry_sweeper_thread = Thread(
+        target=_run_expiry_sweeper,
+        name="aura-reply-deadline-sweeper",
+        daemon=True,
+    )
+    _expiry_sweeper_thread.start()
+
+
+def _stop_expiry_sweeper() -> None:
+    global _expiry_sweeper_thread
+    _expiry_sweeper_stop.set()
+    if _expiry_sweeper_thread is not None:
+        _expiry_sweeper_thread.join(timeout=2.0)
+    _expiry_sweeper_thread = None
+
+
 def _serialize_result(result: StreamingResult) -> Dict[str, Any]:
     payload = json.loads(result_as_json(result))
     sensor_data = _event_sensor_data.get(result.event_id)
@@ -149,43 +211,45 @@ def _serialize_result(result: StreamingResult) -> Dict[str, Any]:
     return payload
 
 
-def _record_result(result: StreamingResult, event: InputEvent) -> None:
-    global _latest_result, _active_prompt
+def _record_result(result: StreamingResult, event: Optional[InputEvent] = None) -> None:
+    global _latest_result
     _latest_result = result
-    _event_sensor_data[result.event_id] = {
-        "observations": dict(event.observations),
-        "source": event.source,
-        "subject_id": event.subject_id,
-        "occurred_at": event.occurred_at.isoformat(),
-        "is_mock": event.source.startswith("synthetic-") or "simulator" in event.source,
-    }
-    # Check if duplicate event_id already stored
-    if not any(r.event_id == result.event_id for r in _processed_results):
+    if event is not None:
+        _event_sensor_data[result.event_id] = {
+            "observations": dict(event.observations),
+            "source": event.source,
+            "subject_id": event.subject_id,
+            "occurred_at": event.occurred_at.isoformat(),
+            "is_mock": event.source.startswith("synthetic-") or "simulator" in event.source,
+        }
+    for index, previous in enumerate(_processed_results):
+        if previous.event_id == result.event_id:
+            _processed_results[index] = result
+            break
+    else:
         _processed_results.insert(0, result)
 
-    if result.voice_prompt is not None:
-        _active_prompt = {
-            "event_id": result.voice_prompt.event_id,
-            "conversation_id": result.voice_prompt.conversation_id,
-            "text": result.voice_prompt.text,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "pending_reply",
-        }
-
-    if result.receipt is not None and result.receipt.external_reference:
+    is_ticket_action = (
+        result.proposal is not None
+        and result.proposal.action_type in _demo.dashboard.TICKET_ACTIONS
+    )
+    if is_ticket_action and result.receipt is not None and result.receipt.external_reference:
         rec_id = result.receipt.external_reference
         if rec_id not in _tickets_meta:
+            record = next(
+                (item for item in _demo.dashboard.records if item.record_id == rec_id),
+                None,
+            )
             _tickets_meta[rec_id] = {
-                "status": "awaiting_human_review",
+                "status": record.status if record is not None else "awaiting_human_review",
                 "notes": "",
-                "priority": "High" if "critical" in result.event_id else "Normal",
+                "priority": record.priority if record is not None else "Normal",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
 
 class SimulateRequest(BaseModel):
     scenario: Optional[str] = "critical-cold"
-    resident_response: Optional[str] = "Jag är okej, men jag vill gärna prata med personalen."
     custom_observations: Optional[Dict[str, Any]] = None
 
 
@@ -198,6 +262,15 @@ class TicketUpdateRequest(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
     priority: Optional[str] = None
+
+
+class TicketFeedbackRequest(BaseModel):
+    label: Literal["false_alarm", "justified", "sensor_fault"]
+    note: str = ""
+
+
+class BuddyRequestBody(BaseModel):
+    subject_id: str
 
 
 @app.get("/api/status")
@@ -226,17 +299,66 @@ def get_status():
         }
 
 
+@app.get("/api/metrics")
+def get_metrics():
+    with _state_lock:
+        results = tuple(_processed_results)
+        records = _demo.dashboard.records
+        feedback_values = tuple(_ticket_feedback.values())
+        feedback_total = len(feedback_values)
+        false_alarm_total = sum(item["label"] == "false_alarm" for item in feedback_values)
+        dismissed_critical = sum(
+            result.outcome == WorkflowOutcome.DISMISSED
+            and result.assessment.severity is not None
+            and result.assessment.severity.value == "critical"
+            for result in results
+        )
+        visit_actions = {"home_visit", "urgent_visit"}
+        pending_outcomes = {
+            WorkflowOutcome.RUNNING,
+            WorkflowOutcome.AWAITING_RESIDENT,
+            WorkflowOutcome.WAITING_FOR_RESIDENT,
+        }
+        estimated_visits_avoided = sum(
+            result.assessment.is_anomaly
+            and result.outcome not in pending_outcomes
+            and (
+                result.proposal is None
+                or result.proposal.action_type not in visit_actions
+            )
+            for result in results
+        )
+        return {
+            "events_processed": len(results),
+            "dropped": sum(result.outcome == WorkflowOutcome.DROPPED for result in results),
+            "no_action": sum(result.outcome == WorkflowOutcome.NO_ACTION for result in results),
+            "dismissed": sum(result.outcome == WorkflowOutcome.DISMISSED for result in results),
+            "dismissed_critical_review": dismissed_critical,
+            "remote_followups": sum(record.action_type == "remote_followup" for record in records),
+            "home_visits": sum(record.action_type == "home_visit" for record in records),
+            "urgent_visits": sum(record.action_type == "urgent_visit" for record in records),
+            "estimated_visits_avoided": estimated_visits_avoided,
+            "escalated_no_reply": sum(result.outcome == WorkflowOutcome.ESCALATED_NO_REPLY for result in results),
+            "sensor_faults": sum(result.outcome == WorkflowOutcome.SENSOR_FAULT for result in results),
+            "false_alarm_feedback": false_alarm_total,
+            "feedback_total": feedback_total,
+            "false_alarm_rate": false_alarm_total / feedback_total if feedback_total else 0.0,
+        }
+
+
 @app.get("/api/latest")
 def get_latest():
     with _state_lock:
         if _latest_result is None:
             return {"latest": None}
+        _refresh_conversation_results()
         return {"latest": _serialize_result(_latest_result)}
 
 
 @app.get("/api/events")
 def get_events(limit: int = 50):
     with _state_lock:
+        _refresh_conversation_results()
         items = [_serialize_result(r) for r in _processed_results[:limit]]
         return {"events": items}
 
@@ -255,10 +377,7 @@ def simulate_event(req: SimulateRequest):
         else:
             event = make_sensor_event(req.scenario or "critical-cold")
 
-        if req.resident_response:
-            _demo.service._voice_responder._transcriber = FakeSpeechToTextAdapter(req.resident_response)
-
-        result = _demo.service.handle(event)
+        result = _demo.service.start(event)
         _record_result(result, event)
         return {
             "success": True,
@@ -317,7 +436,7 @@ def consume_event():
         with _state_lock:
             try:
                 event = EventMessageCodec.decode(body)
-                result = _demo.service.handle(event)
+                result = _demo.service.start(event)
                 _record_result(result, event)
                 channel.basic_ack(delivery_tag=method.delivery_tag)
                 connection.close()
@@ -351,26 +470,68 @@ class DeviceTriggerRequest(BaseModel):
     custom_observations: Optional[Dict[str, Any]] = None
 
 
-class DeviceRespondRequest(BaseModel):
-    text_response: Optional[str] = None
-    audio_base64: Optional[str] = None
+def _refresh_conversation_results() -> None:
+    global _latest_result
+    results = {result.event_id: result for result in _demo.service.results()}
+    for index, previous in enumerate(_processed_results):
+        if previous.event_id in results:
+            _processed_results[index] = results[previous.event_id]
+    if _latest_result is not None:
+        _latest_result = results.get(_latest_result.event_id, _latest_result)
+
+
+def _device_prompt(result: StreamingResult) -> Optional[Dict[str, Any]]:
+    prompt = result.voice_prompt
+    if prompt is None or result.outcome not in {
+        WorkflowOutcome.AWAITING_RESIDENT,
+        WorkflowOutcome.WAITING_FOR_RESIDENT,
+    }:
+        return None
+    sensor_data = _event_sensor_data[result.event_id]
+    return {
+        "event_id": prompt.event_id,
+        "conversation_id": prompt.conversation_id,
+        "subject_id": sensor_data["subject_id"],
+        "text": prompt.text,
+        "created_at": sensor_data["occurred_at"],
+        "status": "pending_reply",
+        "observations": sensor_data["observations"],
+        "reply_timeout_seconds": _demo.service.reply_timeout_seconds(prompt.conversation_id),
+        "remaining_reply_seconds": _demo.service.remaining_reply_seconds(prompt.conversation_id),
+        "playback": {
+            "output_mode": prompt.speaker_receipt.output_mode,
+            "delivered": prompt.speaker_receipt.delivered,
+        },
+    }
+
+
+class PlaybackRequest(BaseModel):
+    event_id: str
+    subject_id: str
+    conversation_id: str
+    provider: Literal["browser_speech", "gtts"]
+    status: Literal["started", "completed", "stopped", "failed", "blocked"]
+
+
+@app.post("/api/device/playback")
+def record_device_playback(receipt: PlaybackRequest):
+    with _state_lock:
+        try:
+            result = _demo.service.record_playback(**receipt.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        _record_result(result)
+        return {"success": True, "playback": _serialize_result(result)["voice_prompt"]}
 
 
 @app.get("/api/device/prompt")
-def get_device_prompt():
+def get_device_prompt(subject_id: str = DEFAULT_SUBJECT_ID):
     with _state_lock:
-        global _active_prompt
-        if _active_prompt is None:
-            if _latest_result is not None and _latest_result.voice_prompt is not None:
-                _active_prompt = {
-                    "event_id": _latest_result.voice_prompt.event_id,
-                    "conversation_id": _latest_result.voice_prompt.conversation_id,
-                    "text": _latest_result.voice_prompt.text,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "pending_reply",
-                }
+        prompts = _demo.service.pending_prompts(subject_id)
+        _refresh_conversation_results()
+        result = next((item for item in _processed_results if prompts and item.event_id == prompts[0].event_id), None)
         return {
-            "prompt": _active_prompt,
+            "prompt": _device_prompt(result) if result is not None else None,
             "whisper_configured": _kb_whisper.is_configured,
         }
 
@@ -378,116 +539,95 @@ def get_device_prompt():
 @app.post("/api/device/trigger-prompt")
 def trigger_device_prompt(req: DeviceTriggerRequest):
     with _state_lock:
-        global _active_prompt, _pending_device_event
         if req.custom_observations:
             event = InputEvent(
                 event_id=f"sensor-device-{uuid4().hex[:8]}",
                 occurred_at=datetime.now(timezone.utc),
                 subject_id=DEFAULT_SUBJECT_ID,
-                source="resident-device-trigger",
+                source="synthetic-device-trigger",
                 observations=req.custom_observations,
             )
         else:
             event = make_sensor_event(req.scenario or "critical-cold", event_id=f"sensor-device-{uuid4().hex[:8]}")
 
-        _pending_device_event = event
-        assessment = _demo.service._supervisor(event)
-        if not assessment.is_anomaly and not assessment.requires_review:
+        result = _demo.service.start(event)
+        _record_result(result, event)
+        if result.outcome == WorkflowOutcome.NO_ACTION:
             return {
                 "success": False,
                 "message": "Supervisor evaluated readings as normal. No resident prompt required.",
                 "outcome": "no_action",
             }
 
-        prompt_text = (
-            "Hej. Vi har märkt en avvikelse i sensorerna hemma hos dig. Är allt bra? Berätta gärna om du behöver hjälp."
-        )
-        conv_id = uuid4().hex
-        _active_prompt = {
-            "event_id": event.event_id,
-            "conversation_id": conv_id,
-            "text": prompt_text,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "pending_reply",
-            "observations": dict(event.observations),
-        }
         return {
             "success": True,
-            "prompt": _active_prompt,
+            "prompt": _device_prompt(result),
             "whisper_configured": _kb_whisper.is_configured,
         }
 
 
 @app.get("/api/device/tts")
-def get_device_tts(text: Optional[str] = None):
-    speech_text = text or (_active_prompt.get("text") if _active_prompt else "Hej, vi har märkt en avvikelse. Hur mår du?")
+def get_device_tts(text: str):
+    if not text.strip() or len(text) > 2000:
+        raise HTTPException(status_code=422, detail="Prompt text must contain 1 to 2000 characters")
     try:
-        audio_bytes = _google_tts.synthesize(speech_text, language="sv")
+        audio_bytes = _google_tts.synthesize(text, language="sv")
         return Response(
             content=audio_bytes,
             media_type="audio/mpeg",
             headers={"Content-Disposition": "inline; filename=speech.mp3"},
         )
-    except Exception as error:
-        logger.error("TTS generation failed: %s", error)
-        raise HTTPException(status_code=500, detail=f"Google TTS generation error: {error}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Speech playback could not be generated; please retry") from None
 
 
 @app.post("/api/device/respond")
-async def respond_from_device(
-    text_response: Optional[str] = Form(None),
-    audio_file: Optional[UploadFile] = File(None),
+def respond_from_device(
+    event_id: str = Form(...),
+    subject_id: str = Form(...),
+    conversation_id: str = Form(...),
+    audio_file: UploadFile = File(...),
 ):
-    global _active_prompt, _pending_device_event
-
-    transcript_text = ""
-    stt_source = "manual_text"
-    audio_bytes: Optional[bytes] = None
-
-    if audio_file is not None:
-        audio_bytes = await audio_file.read()
-
-    # Transcribe with KB-Whisper if audio provided
-    if audio_bytes and len(audio_bytes) > 0:
-        recording = AudioRecording(
-            audio=audio_bytes,
-            filename=audio_file.filename if audio_file else "audio.wav",
-            content_type=audio_file.content_type if audio_file else "audio/wav",
-        )
-        if _kb_whisper.is_configured:
-            try:
-                t_res = _kb_whisper.transcribe(recording, language="sv")
-                transcript_text = t_res.text
-                stt_source = "orange-kb-whisper"
-            except Exception as err:
-                logger.warning("KB-Whisper transcription failed, using fallback: %s", err)
-                transcript_text = text_response or "Jag ramlade och behöver hjälp med en gång."
-                stt_source = f"fallback-error: {err}"
-        else:
-            transcript_text = text_response or "Jag mår bra men känner mig lite kall."
-            stt_source = "fallback-no-api-key"
-    else:
-        transcript_text = text_response or "Jag är okej, tack för omtanken."
-
+    audio_bytes = audio_file.file.read(5 * 1024 * 1024 + 1)
+    if len(audio_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Recording exceeds the 5 MiB limit")
+    if not audio_bytes:
+        raise HTTPException(status_code=422, detail="Recording is empty")
+    if not _kb_whisper.is_configured:
+        raise HTTPException(status_code=503, detail="KB-Whisper is not configured on the backend")
+    recording = AudioRecording(audio_bytes, audio_file.filename or "reply.wav", "audio/wav")
     with _state_lock:
-        # Use pending event or make new critical-cold event if none pending
-        event = _pending_device_event or make_sensor_event("critical-cold")
-        _demo.service._voice_responder._transcriber = FakeSpeechToTextAdapter(transcript_text)
-        result = _demo.service.handle(event)
-        _record_result(result, event)
-
-        if _active_prompt:
-            _active_prompt["status"] = "answered"
-            _active_prompt["resident_reply"] = transcript_text
-
-        ticket_id = result.receipt.external_reference if result.receipt is not None else None
+        try:
+            result = _demo.service.resume_audio(
+                event_id=event_id, subject_id=subject_id, conversation_id=conversation_id,
+                recording=recording, transcriber=_kb_whisper, signal_analyzer=_signal_analyzer,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        except Exception:
+            raise HTTPException(status_code=502, detail="Voice or agent processing failed; the conversation is pending for retry") from None
+        _record_result(result)
+        has_ticket = (
+            result.receipt is not None
+            and result.proposal is not None
+            and result.proposal.action_type in _demo.dashboard.TICKET_ACTIONS
+        )
+        ticket_id = result.receipt.external_reference if has_ticket else None
+        action_record_id = (
+            result.receipt.external_reference
+            if result.receipt is not None and not has_ticket
+            else None
+        )
 
         return {
             "success": True,
-            "transcript": transcript_text,
-            "stt_source": stt_source,
+            "event_id": result.event_id,
+            "conversation_id": result.voice_prompt.conversation_id,
+            "transcript": result.voice_reply.transcript.text,
+            "stt_source": result.voice_reply.transcript.source,
             "outcome": result.outcome.value,
             "ticket_id": ticket_id,
+            "action_record_id": action_record_id,
             "guardian_status": result.decision.status.value if result.decision else None,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -500,24 +640,183 @@ def get_tickets():
         tickets_list = []
         for r in reversed(records):
             meta = _tickets_meta.get(r.record_id, {
-                "status": "awaiting_human_review",
+                "status": r.status,
                 "notes": "",
-                "priority": "High" if "critical" in r.event_id else "Normal",
+                "priority": r.priority,
                 "updated_at": r.created_at.isoformat(),
             })
             tickets_list.append({
                 "record_id": r.record_id,
                 "event_id": r.event_id,
                 "proposal_id": r.proposal_id,
+                "action_type": r.action_type,
+                "triage_stage": r.triage_stage,
                 "subject_id": r.subject_id,
                 "created_at": r.created_at.isoformat(),
-                "status": meta.get("status", "awaiting_human_review"),
+                "status": meta.get("status", r.status),
                 "notes": meta.get("notes", ""),
-                "priority": meta.get("priority", "Normal"),
+                "priority": meta.get("priority", r.priority),
                 "summary": r.summary,
                 "observations": dict(r.observations),
+                "feedback": _ticket_feedback.get(r.record_id),
             })
         return {"tickets": tickets_list}
+
+
+@app.get("/api/action-records")
+def get_action_records():
+    with _state_lock:
+        return {
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "event_id": record.event_id,
+                    "proposal_id": record.proposal_id,
+                    "action_type": record.action_type,
+                    "record_type": record.record_type,
+                    "subject_id": record.subject_id,
+                    "created_at": record.created_at.isoformat(),
+                    "reason": record.reason,
+                    "parameters": dict(record.parameters),
+                }
+                for record in _demo.dashboard.action_records
+            ]
+        }
+
+
+@app.get("/api/buddies")
+def get_demo_buddies():
+    return {"buddies": list(_SYNTHETIC_BUDDIES), "demo_only": True}
+
+
+@app.get("/api/buddy-requests")
+def get_buddy_requests():
+    with _state_lock:
+        return {"requests": list(_buddy_requests), "demo_only": True}
+
+
+@app.post("/api/buddies/{buddy_id}/request")
+def request_demo_buddy(buddy_id: str, request: BuddyRequestBody):
+    buddy = next((item for item in _SYNTHETIC_BUDDIES if item["buddy_id"] == buddy_id), None)
+    if buddy is None:
+        raise HTTPException(status_code=404, detail="Demo buddy not found")
+    if not request.subject_id.strip():
+        raise HTTPException(status_code=422, detail="subject_id must not be empty")
+    with _state_lock:
+        entry = {
+            "request_id": str(uuid4()),
+            "buddy_id": buddy_id,
+            "buddy_name": buddy["name"],
+            "subject_id": request.subject_id.strip(),
+            "status": "queued_demo",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _buddy_requests.append(entry)
+        return {"success": True, "request": entry, "demo_only": True}
+
+
+def _baseline_value_changed(observed: Any, baseline: Any) -> bool:
+    if isinstance(observed, bool) or isinstance(baseline, bool):
+        return type(observed) is not type(baseline) or observed != baseline
+    if isinstance(observed, (int, float)) and isinstance(baseline, (int, float)):
+        return isfinite(observed) and isfinite(baseline) and observed != baseline
+    return type(observed) is not type(baseline) or observed != baseline
+
+
+def _refresh_baseline_suggestions(subject_id: str) -> None:
+    baseline = _demo.baseline_store.get_baseline(subject_id)
+    if baseline is None:
+        return
+    matching_records = {record.record_id: record for record in _demo.dashboard.records}
+    samples_by_field: Dict[str, List[Any]] = {}
+    for ticket_id, feedback in _ticket_feedback.items():
+        record = matching_records.get(ticket_id)
+        if (
+            record is None
+            or record.subject_id != subject_id
+            or feedback["label"] != "false_alarm"
+        ):
+            continue
+        for field, observed in record.observations.items():
+            if field in baseline and _baseline_value_changed(observed, baseline[field]):
+                if observed is None or isinstance(observed, (str, int, float, bool)):
+                    samples_by_field.setdefault(field, []).append(observed)
+
+    for field, values in samples_by_field.items():
+        if len(values) < _FALSE_ALARM_SUGGESTION_THRESHOLD:
+            continue
+        key = (subject_id, field)
+        existing = _baseline_suggestions.get(key)
+        if existing is not None and existing["status"] == "applied":
+            continue
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            suggested_value = median(values)
+        else:
+            suggested_value = Counter(values).most_common(1)[0][0]
+        _baseline_suggestions[key] = {
+            "subject_id": subject_id,
+            "field": field,
+            "current_value": baseline[field],
+            "suggested_value": suggested_value,
+            "false_alarm_count": len(values),
+            "status": "pending_review",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@app.get("/api/baseline-suggestions")
+def get_baseline_suggestions():
+    with _state_lock:
+        return {"suggestions": list(_baseline_suggestions.values())}
+
+
+@app.post("/api/tickets/{record_id}/feedback")
+def record_ticket_feedback(record_id: str, feedback: TicketFeedbackRequest):
+    with _state_lock:
+        record = next(
+            (item for item in _demo.dashboard.records if item.record_id == record_id),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        if _tickets_meta.get(record_id, {}).get("status", record.status) != "resolved":
+            raise HTTPException(status_code=409, detail="Resolve the ticket before submitting caseworker feedback")
+        if len(feedback.note) > 1000:
+            raise HTTPException(status_code=422, detail="Feedback note must be 1000 characters or fewer")
+        entry = {
+            "ticket_id": record_id,
+            "event_id": record.event_id,
+            "subject_id": record.subject_id,
+            "label": feedback.label,
+            "note": feedback.note.strip(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _ticket_feedback[record_id] = entry
+        _refresh_baseline_suggestions(record.subject_id)
+        return {
+            "success": True,
+            "feedback": entry,
+            "suggestions": list(_baseline_suggestions.values()),
+        }
+
+
+@app.post("/api/baseline-suggestions/{subject_id}/{field}/apply")
+def apply_baseline_suggestion(subject_id: str, field: str):
+    with _state_lock:
+        suggestion = _baseline_suggestions.get((subject_id, field))
+        if suggestion is None:
+            raise HTTPException(status_code=404, detail="Baseline suggestion not found")
+        if suggestion["status"] != "pending_review":
+            raise HTTPException(status_code=409, detail="Baseline suggestion is not pending review")
+        baseline = _demo.baseline_store.get_baseline(subject_id)
+        if baseline is None:
+            raise HTTPException(status_code=409, detail="Resident baseline is unavailable")
+        updated_baseline = dict(baseline)
+        updated_baseline[field] = suggestion["suggested_value"]
+        _demo.baseline_store.set_baseline(subject_id, updated_baseline)
+        suggestion["status"] = "applied"
+        suggestion["applied_at"] = datetime.now(timezone.utc).isoformat()
+        return {"success": True, "suggestion": suggestion, "baseline": updated_baseline}
 
 
 @app.patch("/api/tickets/{record_id}")

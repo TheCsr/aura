@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from aura.agents.critical_risk_policy import CriticalRiskPolicy
 from aura.composition import create_demo_system
 from aura.contracts import ActionProposal, DispatchStatus, InputEvent
-from aura.dashboard import MockDashboardAdapter
+from aura.dashboard import MockDashboardActionTool, MockDashboardAdapter
 from aura.graph import WorkflowOutcome
 
 
@@ -24,6 +24,58 @@ def make_event(event_id="evt-dashboard-1", door_state="open", motion_detected=Fa
 
 
 class MockDashboardAdapterTests(unittest.TestCase):
+    def test_visit_ticket_actions_receive_action_specific_priorities(self):
+        adapter = MockDashboardAdapter()
+        for action, priority in (
+            ("remote_followup", "Normal"),
+            ("home_visit", "High"),
+            ("urgent_visit", "Urgent"),
+            ("maintenance_ticket", "Normal"),
+        ):
+            with self.subTest(action=action):
+                event = make_event(event_id=f"event-{action}")
+                proposal = ActionProposal(
+                    proposal_id=f"proposal-{action}",
+                    event_id=event.event_id,
+                    action_type=action,
+                    rationale=f"Approved {action} for synthetic review.",
+                    confidence=0.9,
+                )
+                receipt = MockDashboardActionTool(adapter, action).execute(event, proposal)
+
+                self.assertEqual(receipt.status, DispatchStatus.SUCCEEDED)
+                record = next(record for record in adapter.records if record.action_type == action)
+                self.assertEqual(record.priority, priority)
+
+    def test_dismiss_notification_and_planned_visit_create_action_records_not_tickets(self):
+        adapter = MockDashboardAdapter()
+        expected_record_types = {
+            "dismiss": "dismissal_audit",
+            "notify_relative": "relative_notification",
+            "attach_to_planned_visit": "planned_visit_note",
+        }
+
+        for action, record_type in expected_record_types.items():
+            with self.subTest(action=action):
+                event = make_event(event_id=f"event-{action}")
+                proposal = ActionProposal(
+                    proposal_id=f"proposal-{action}",
+                    event_id=event.event_id,
+                    action_type=action,
+                    rationale=f"Approved {action} reason.",
+                    confidence=0.9,
+                )
+                tool = MockDashboardActionTool(adapter, action)
+                first = tool.execute(event, proposal)
+                second = tool.execute(event, proposal)
+
+                self.assertEqual(first.status, DispatchStatus.SUCCEEDED)
+                self.assertEqual(second.external_reference, first.external_reference)
+                self.assertEqual(adapter.records, ())
+                record = next(item for item in adapter.action_records if item.action_type == action)
+                self.assertEqual(record.record_type, record_type)
+                self.assertEqual(record.reason, proposal.rationale)
+
     def test_creates_dashboard_review_record_and_receipt(self):
         event = make_event()
         proposal = ActionProposal(

@@ -15,7 +15,7 @@ from ..messaging.adapters.lavinmq import (
     PikaLavinMQConsumer,
     PikaLavinMQPublisher,
 )
-from ..sensors.application import ValidatedSensorEventHandler, ValidatedSensorEventPublisher
+from ..sensors.application import ValidatedSensorEventPublisher
 from .composition import DEFAULT_SUBJECT_ID, create_streaming_demo
 from .service import StreamingResult
 
@@ -86,6 +86,17 @@ def _load_dotenv_if_present() -> None:
 
 
 def result_as_json(result: StreamingResult) -> str:
+    ticket_actions = {
+        "request_human_review",
+        "maintenance_ticket",
+        "remote_followup",
+        "home_visit",
+        "urgent_visit",
+    }
+    is_ticket_action = (
+        result.proposal is not None
+        and result.proposal.action_type in ticket_actions
+    )
     payload = {
         "event_id": result.event_id,
         "outcome": result.outcome.value,
@@ -94,6 +105,12 @@ def result_as_json(result: StreamingResult) -> str:
             "requires_review": result.assessment.requires_review,
             "summary": result.assessment.summary,
             "confidence": result.assessment.confidence,
+            "drop_reason": result.assessment.drop_reason,
+            "severity": result.assessment.severity.value if result.assessment.severity else None,
+            "evidence": [
+                {"source": item.source, "description": item.description, "details": dict(item.details)}
+                for item in result.assessment.evidence
+            ],
         },
         "voice_prompt": (
             {
@@ -118,6 +135,38 @@ def result_as_json(result: StreamingResult) -> str:
             if result.voice_reply is not None
             else None
         ),
+        "triage": (
+            {
+                "event_id": result.proposal.event_id,
+                "proposal_id": result.proposal.proposal_id,
+                "action_type": result.proposal.action_type,
+                "rationale": result.proposal.rationale,
+                "confidence": result.proposal.confidence,
+                "parameters": dict(result.proposal.parameters),
+                "evidence_refs": list(result.proposal.evidence_refs),
+                "triage_stage": result.proposal.triage_stage.value,
+            } if result.proposal is not None else None
+        ),
+        "triage_passes": [
+            {
+                "event_id": proposal.event_id,
+                "proposal_id": proposal.proposal_id,
+                "action_type": proposal.action_type,
+                "rationale": proposal.rationale,
+                "confidence": proposal.confidence,
+                "parameters": dict(proposal.parameters),
+                "evidence_refs": list(proposal.evidence_refs),
+                "triage_stage": proposal.triage_stage.value,
+            }
+            for proposal in result.triage_passes
+        ],
+        "dispatcher": (
+            {
+                "status": result.receipt.status.value,
+                "message": result.receipt.message,
+                "external_reference": result.receipt.external_reference,
+            } if result.receipt is not None else None
+        ),
         "guardian": (
             {
                 "status": result.decision.status.value,
@@ -128,7 +177,16 @@ def result_as_json(result: StreamingResult) -> str:
             else None
         ),
         "dashboard_record_id": (
-            result.receipt.external_reference if result.receipt is not None else None
+            result.receipt.external_reference
+            if is_ticket_action and result.receipt is not None
+            else None
+        ),
+        "action_record_id": (
+            result.receipt.external_reference
+            if result.proposal is not None
+            and result.proposal.action_type not in ticket_actions
+            and result.receipt is not None
+            else None
         ),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
@@ -150,7 +208,7 @@ def _consume() -> None:
     settings = LavinMQSettings.from_environment()
     consumer = PikaLavinMQConsumer(
         settings,
-        ValidatedSensorEventHandler(handle_event),
+        handle_event,
     )
     try:
         consumer.run_forever()

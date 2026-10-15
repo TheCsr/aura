@@ -1,12 +1,180 @@
 import unittest
+import os
+from unittest.mock import Mock, patch
+from pathlib import Path
+
+import requests
 
 from aura.contracts import Transcript
 from aura.voice import AudioRecording, ResidentVoiceSession, SpeakerReceipt
 from aura.voice.adapters.fake_stt import FakeSpeechToTextAdapter
 from aura.voice.testing import MockMicrophone, MockSpeaker, MockVoiceTranscriber
+from aura.voice.adapters.orange_kb_whisper import OrangeKbWhisperAdapter
 
 
 class VoiceComponentTests(unittest.TestCase):
+    def test_resident_launcher_uses_env_host_and_port_without_starting_server(self):
+        import run_resident_device
+        import sys
+
+        with patch.dict(os.environ, {
+            "AURA_DEVICE_HOST": "127.0.0.1",
+            "AURA_DEVICE_PORT": "8517",
+        }, clear=True), patch("run_resident_device._load_env"), patch(
+            "run_resident_device.subprocess.call", return_value=0
+        ) as call:
+            result = run_resident_device.main()
+
+        self.assertEqual(result, 0)
+        command = call.call_args.args[0]
+        self.assertEqual(command[0:3], [sys.executable, "-m", "streamlit"])
+        self.assertEqual(command[-4:], ["--server.address", "127.0.0.1", "--server.port", "8517"])
+
+    @patch("aura.voice.adapters.orange_kb_whisper.requests.post")
+    def test_whisper_adapter_uses_bser_url_when_kb_whisper_url_is_unset(self, post):
+        post.return_value.json.return_value = {"text": "Hej."}
+        with patch.dict(os.environ, {"BSER_URL": "https://speech.example", "ORANGE_API_KEY": "test-key"}, clear=True):
+            adapter = OrangeKbWhisperAdapter()
+            adapter.transcribe(AudioRecording(b"audio", "reply.wav", "audio/wav"))
+
+        self.assertEqual(post.call_args.args[0], "https://speech.example/v1/audio/transcriptions")
+
+    def test_kb_whisper_url_takes_precedence_over_bser_url(self):
+        with patch.dict(os.environ, {
+            "KB_WHISPER_URL": "https://preferred.example/",
+            "BSER_URL": "https://legacy.example",
+        }, clear=True):
+            adapter = OrangeKbWhisperAdapter()
+
+        self.assertEqual(adapter._base_url, "https://preferred.example")
+
+    def test_resident_app_forwards_correlated_playback_once_without_synthesis(self):
+        from streamlit.testing.v1 import AppTest
+
+        pending = {
+            "subject_id": "synthetic-resident-1", "event_id": "speaker-event",
+            "conversation_id": "speaker-conversation", "text": "Hej!",
+        }
+        receipt = {**pending, "action": "playback", "provider": "browser_speech", "status": "completed", "notification_id": "receipt-1"}
+        response = Mock()
+        response.json.return_value = {"prompt": pending, "whisper_configured": True}
+        component = Mock(return_value=receipt)
+        with patch("requests.get", return_value=response), patch("requests.post") as post, patch("gtts.gTTS") as tts, patch("streamlit.components.v1.declare_component", return_value=component):
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "resident_device_app.py"))
+            app.run(timeout=10)
+            app.run(timeout=10)
+            self.assertEqual(len(app.exception), 0)
+            post.assert_called_once()
+            self.assertTrue(post.call_args.args[0].endswith("/api/device/playback"))
+            self.assertEqual(post.call_args.kwargs["json"], {
+                **{key: pending[key] for key in ("subject_id", "event_id", "conversation_id")},
+                "provider": "browser_speech", "status": "completed",
+            })
+            tts.assert_not_called()
+            self.assertEqual(component.call_args.kwargs["key"], "resident-speaker")
+
+    def test_resident_app_ignores_stale_playback_receipts(self):
+        from streamlit.testing.v1 import AppTest
+
+        pending = {
+            "subject_id": "synthetic-resident-1", "event_id": "speaker-event",
+            "conversation_id": "speaker-conversation", "text": "Hej!",
+        }
+        receipt = {**pending, "conversation_id": "old-conversation", "action": "playback", "provider": "browser_speech", "status": "completed", "notification_id": "receipt-1"}
+        response = Mock()
+        response.json.return_value = {"prompt": pending, "whisper_configured": True}
+        with patch("requests.get", return_value=response), patch("requests.post") as post, patch("streamlit.components.v1.declare_component", return_value=Mock(return_value=receipt)):
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "resident_device_app.py"))
+            app.run(timeout=10)
+            self.assertEqual(len(app.exception), 0)
+            post.assert_not_called()
+
+    def test_resident_app_synthesizes_fallback_only_on_request_without_delivery_claim(self):
+        from streamlit.testing.v1 import AppTest
+
+        pending = {
+            "subject_id": "synthetic-resident-1", "event_id": "speaker-event",
+            "conversation_id": "speaker-conversation", "text": "Hej!",
+        }
+        receipt = {**pending, "action": "fallback", "provider": "gtts", "status": "requested", "notification_id": "receipt-1"}
+        response = Mock()
+        response.json.return_value = {"prompt": pending, "whisper_configured": True}
+        with patch("requests.get", return_value=response), patch("requests.post") as post, patch("gtts.gTTS") as tts, patch("streamlit.rerun"), patch("streamlit.components.v1.declare_component", return_value=Mock(return_value=receipt)):
+            tts.return_value.write_to_fp.side_effect = lambda buffer: buffer.write(b"actual-mp3")
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "resident_device_app.py"))
+            app.run(timeout=10)
+            self.assertEqual(len(app.exception), 0)
+            tts.assert_called_once_with(text="Hej!", lang="sv", slow=False, timeout=(5, 20))
+            self.assertEqual(app.session_state["speaker_audio"], "YWN0dWFsLW1wMw==")
+            post.assert_not_called()
+
+    def test_resident_app_handles_no_prompt_and_pending_prompt_without_speech_calls(self):
+        from streamlit.testing.v1 import AppTest
+
+        pending = {
+            "subject_id": "synthetic-resident-1",
+            "event_id": "screen-event",
+            "conversation_id": "screen-conversation",
+            "text": "Har du det bra?",
+            "remaining_reply_seconds": 118,
+        }
+        for prompt in (None, pending):
+            response = Mock()
+            response.json.return_value = {"prompt": prompt, "whisper_configured": True}
+            with self.subTest(prompt=prompt), patch("requests.get", return_value=response), patch("requests.post") as post, patch("gtts.gTTS") as tts:
+                app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "resident_device_app.py"))
+                app.run(timeout=10)
+                self.assertEqual(len(app.exception), 0)
+                if prompt is not None:
+                    self.assertIn("Time remaining: 01:58", [item.value for item in app.caption])
+                post.assert_not_called()
+                tts.assert_not_called()
+
+    def test_resident_prompt_is_rendered_as_text_not_html(self):
+        from streamlit.testing.v1 import AppTest
+
+        unsafe_looking_text = 'Är allt bra? <script>alert("test")</script>'
+        pending = {
+            "subject_id": "synthetic-resident-1",
+            "event_id": "screen-event",
+            "conversation_id": "screen-conversation",
+            "text": unsafe_looking_text,
+        }
+        response = Mock()
+        response.json.return_value = {"prompt": pending, "whisper_configured": True}
+        with patch("requests.get", return_value=response), patch("requests.post"):
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "resident_device_app.py"))
+            app.run(timeout=10)
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn(unsafe_looking_text, [element.value for element in app.text])
+        self.assertFalse(any("<script>" in element.value for element in app.markdown))
+
+    @patch("aura.voice.adapters.orange_kb_whisper.requests.post")
+    def test_real_stt_adapter_uploads_actual_recording_once(self, post):
+        post.return_value.json.return_value = {"text": " Hjälp mig. "}
+        adapter = OrangeKbWhisperAdapter(api_key="test-key", base_url="https://speech.example", model="test-model")
+        recording = AudioRecording(b"actual-upload", "reply.wav", "audio/wav")
+        transcript = adapter.transcribe(recording, language="sv")
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["files"]["file"][1], recording.audio)
+        self.assertEqual(transcript.text, "Hjälp mig.")
+        self.assertEqual(transcript.source, "orange-kb-whisper")
+
+    @patch("aura.voice.adapters.orange_kb_whisper.requests.post")
+    def test_real_stt_adapter_rejects_empty_output_and_sanitizes_transport_errors(self, post):
+        adapter = OrangeKbWhisperAdapter(api_key="test-key")
+        recording = AudioRecording(b"audio", "reply.wav", "audio/wav")
+        for payload in ({"text": " "}, {}, {"text": 42}, []):
+            post.return_value.json.return_value = payload
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                adapter.transcribe(recording)
+        post.side_effect = requests.Timeout("private-url test-key")
+        with self.assertRaises(RuntimeError) as raised:
+            adapter.transcribe(recording)
+        self.assertNotIn("test-key", str(raised.exception))
+        self.assertNotIn("private-url", str(raised.exception))
+
     def test_mock_speaker_records_prompt_without_claiming_audio_delivery(self):
         speaker = MockSpeaker()
 

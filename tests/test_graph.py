@@ -52,6 +52,17 @@ def make_decision(event, proposal, status=DecisionStatus.APPROVE):
 
 
 class AgentGraphTests(unittest.TestCase):
+    def test_workflow_outcomes_include_new_values_and_preserve_existing_values(self):
+        self.assertEqual(WorkflowOutcome.DROPPED.value, "dropped")
+        self.assertEqual(WorkflowOutcome.DISMISSED.value, "dismissed")
+        self.assertEqual(WorkflowOutcome.AWAITING_RESIDENT.value, "awaiting_resident")
+        self.assertEqual(WorkflowOutcome.ESCALATED_NO_REPLY.value, "escalated_no_reply")
+        self.assertEqual(WorkflowOutcome.SENSOR_FAULT.value, "sensor_fault")
+        self.assertEqual(WorkflowOutcome.WAITING_FOR_RESIDENT.value, "waiting_for_resident")
+        self.assertEqual(WorkflowOutcome.VOICE_EXPIRED.value, "voice_expired")
+        self.assertEqual(WorkflowOutcome.NO_ACTION.value, "no_action")
+        self.assertEqual(WorkflowOutcome.DISPATCHED.value, "dispatched")
+
     def test_normal_assessment_stops_before_triage(self):
         event = make_event()
         calls = []

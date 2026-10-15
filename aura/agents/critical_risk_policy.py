@@ -1,15 +1,19 @@
 """Deterministic Guardian policy for critical environmental sensor conditions."""
 
 from dataclasses import dataclass
+from datetime import datetime
 import math
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 from ..contracts import (
+    ActionType,
     ActionProposal,
     Assessment,
+    AssessmentSeverity,
     DecisionStatus,
     GuardianDecision,
     InputEvent,
+    TriageStage,
 )
 from ..ports import ActionPolicy
 
@@ -63,8 +67,20 @@ class CriticalRiskPolicy(ActionPolicy):
         {"temperature_c", "humidity_pct", "door_state", "motion_detected"}
     )
 
-    def __init__(self, thresholds: Optional[CriticalRiskThresholds] = None) -> None:
+    def __init__(
+        self,
+        thresholds: Optional[CriticalRiskThresholds] = None,
+        *,
+        resident_contexts: Optional[Mapping[str, Mapping[str, object]]] = None,
+    ) -> None:
         self._thresholds = thresholds or CriticalRiskThresholds()
+        self._resident_contexts = {}
+        for subject_id, context in (resident_contexts or {}).items():
+            if not isinstance(subject_id, str) or not subject_id.strip():
+                raise ValueError("resident context subject IDs must be non-empty strings")
+            if not isinstance(context, Mapping):
+                raise ValueError("resident contexts must be mappings")
+            self._resident_contexts[subject_id] = dict(context)
 
     def evaluate(
         self,
@@ -80,6 +96,36 @@ class CriticalRiskPolicy(ActionPolicy):
                 ("event_binding_mismatch",),
                 "Event, assessment, and proposal identifiers must match.",
             )
+        if proposal.action_type == ActionType.MAINTENANCE_TICKET.value:
+            if (
+                assessment.requires_review
+                and assessment.evidence
+                and all(item.source == "sensor_quality" for item in assessment.evidence)
+            ):
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.APPROVE,
+                    ("sensor_quality_maintenance",),
+                    "Validated sensor-quality evidence supports a maintenance ticket, not a resident visit.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.DENY,
+                ("maintenance_requires_sensor_quality_evidence",),
+                "Maintenance tickets require a review-required sensor-quality assessment.",
+            )
+        if proposal.action_type in {
+            ActionType.DISMISS.value,
+            ActionType.ASK_RESIDENT.value,
+            ActionType.REMOTE_FOLLOWUP.value,
+            ActionType.HOME_VISIT.value,
+            ActionType.URGENT_VISIT.value,
+            ActionType.NOTIFY_RELATIVE.value,
+            ActionType.ATTACH_TO_PLANNED_VISIT.value,
+        }:
+            return self._evaluate_ladder_action(event, assessment, proposal)
         if proposal.action_type != "request_human_review":
             return self._decision(
                 event,
@@ -117,6 +163,23 @@ class CriticalRiskPolicy(ActionPolicy):
                 ("assessment_not_actionable",),
                 "Supervisor found no anomaly or review requirement.",
             )
+        resident_reply_distress = any(
+            item.source == "resident_reply_escalation"
+            and item.details.get("reason_code") == "resident_reply_distress"
+            for item in assessment.evidence
+        )
+        if (
+            resident_reply_distress
+            and proposal.triage_stage is TriageStage.POST_REPLY
+            and event.transcript is not None
+        ):
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                ("resident_reply_distress",),
+                "A post-reply distress reason code requires immediate human review.",
+            )
         if assessment.requires_review:
             return self._decision(
                 event,
@@ -153,6 +216,210 @@ class CriticalRiskPolicy(ActionPolicy):
             ("critical_threshold_not_met",),
             "An anomaly was reported, but no configured critical sensor condition was met.",
         )
+
+    def _evaluate_ladder_action(
+        self,
+        event: InputEvent,
+        assessment: Assessment,
+        proposal: ActionProposal,
+    ) -> GuardianDecision:
+        missing_fields = self.REQUIRED_SENSOR_FIELDS - set(event.observations)
+        if missing_fields:
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.HOLD,
+                ("sensor_context_incomplete",),
+                "Required sensor readings are missing; Guardian cannot evaluate this action.",
+            )
+        sensor_error = self._validate_sensor_values(event)
+        if sensor_error:
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.HOLD,
+                ("sensor_context_invalid",),
+                sensor_error,
+            )
+        if not assessment.is_anomaly and not assessment.requires_review:
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.DENY,
+                ("assessment_not_actionable",),
+                "Supervisor found no anomaly or review requirement.",
+            )
+
+        indicators = self._risk_indicators(event)
+        critical = assessment.severity is AssessmentSeverity.CRITICAL or bool(indicators)
+        confidence_met = (
+            assessment.confidence >= self._thresholds.minimum_assessment_confidence
+            and proposal.confidence >= self._thresholds.minimum_proposal_confidence
+        )
+
+        if proposal.action_type == ActionType.DISMISS.value:
+            if critical and not (
+                proposal.triage_stage is TriageStage.POST_REPLY
+                and event.transcript is not None
+            ):
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.DENY,
+                    ("critical_dismissal_requires_resident_reply",),
+                    "A critical event cannot be dismissed without a post-reply proposal and a non-empty resident transcript.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                ("triage_dismissal_approved",),
+                "Triage dismissed this event; the decision remains visible in event history.",
+            )
+
+        if proposal.action_type == ActionType.ASK_RESIDENT.value:
+            if (
+                proposal.triage_stage is TriageStage.INITIAL
+                and assessment.severity in {AssessmentSeverity.MODERATE, AssessmentSeverity.CRITICAL}
+            ):
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.APPROVE,
+                    ("resident_checkin_approved",),
+                    "A resident check-in is allowed for moderate or critical severity.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.HOLD,
+                ("resident_checkin_requires_initial_moderate_or_critical_severity",),
+                "A resident check-in requires an initial-pass proposal and moderate or critical severity.",
+            )
+
+        if proposal.action_type in {
+            ActionType.REMOTE_FOLLOWUP.value,
+            ActionType.HOME_VISIT.value,
+        }:
+            if not confidence_met:
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("confidence_below_policy_threshold",),
+                    "Assessment or proposal confidence is below Guardian's configured threshold.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                (f"{proposal.action_type}_approved",),
+                f"The {proposal.action_type} proposal meets Guardian's confidence thresholds.",
+            )
+
+        if proposal.action_type == ActionType.URGENT_VISIT.value:
+            if not critical:
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("urgent_visit_downgraded_to_home_visit",),
+                    "Urgent visit is held and downgraded to a home_visit recommendation for caseworker review.",
+                )
+            if not confidence_met:
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("confidence_below_policy_threshold",),
+                    "Critical evidence exists, but confidence is below Guardian's configured threshold.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                indicators or ("critical_severity",),
+                "Critical severity or a configured critical sensor reason supports an urgent visit.",
+            )
+
+        if proposal.action_type == ActionType.NOTIFY_RELATIVE.value:
+            if not self._has_relative_contact(event.subject_id):
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("relative_contact_unavailable",),
+                    "No demo relative contact is configured for this resident.",
+                )
+            if not confidence_met:
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("confidence_below_policy_threshold",),
+                    "Assessment or proposal confidence is below Guardian's configured threshold.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                ("relative_contact_available",),
+                "A demo relative contact is configured for this resident.",
+            )
+
+        if proposal.action_type == ActionType.ATTACH_TO_PLANNED_VISIT.value:
+            if not self._has_upcoming_visit(event):
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("planned_visit_unavailable",),
+                    "No valid upcoming demo visit is configured for this resident.",
+                )
+            if not confidence_met:
+                return self._decision(
+                    event,
+                    proposal,
+                    DecisionStatus.HOLD,
+                    ("confidence_below_policy_threshold",),
+                    "Assessment or proposal confidence is below Guardian's configured threshold.",
+                )
+            return self._decision(
+                event,
+                proposal,
+                DecisionStatus.APPROVE,
+                ("planned_visit_available",),
+                "A valid upcoming demo visit is configured for this resident.",
+            )
+
+        return self._decision(
+            event,
+            proposal,
+            DecisionStatus.DENY,
+            ("unsupported_action_type",),
+            "This action type has no configured Guardian rule.",
+        )
+
+    def _has_relative_contact(self, subject_id: str) -> bool:
+        contact = self._resident_contexts.get(subject_id, {}).get("relative_contact")
+        if isinstance(contact, str):
+            return bool(contact.strip())
+        if isinstance(contact, Mapping):
+            return any(
+                isinstance(contact.get(field), str) and bool(contact[field].strip())
+                for field in ("name", "phone", "email", "contact_id")
+            )
+        return False
+
+    def _has_upcoming_visit(self, event: InputEvent) -> bool:
+        value = self._resident_contexts.get(event.subject_id, {}).get("next_planned_visit")
+        if not isinstance(value, str) or not value.strip():
+            return False
+        try:
+            scheduled_at = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return scheduled_at.utcoffset() is not None and scheduled_at > event.occurred_at
 
     def _risk_indicators(self, event: InputEvent) -> Tuple[str, ...]:
         observations = event.observations

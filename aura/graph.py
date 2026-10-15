@@ -18,6 +18,13 @@ from .contracts import (
 
 class WorkflowOutcome(str, Enum):
     RUNNING = "running"
+    WAITING_FOR_RESIDENT = "waiting_for_resident"
+    VOICE_EXPIRED = "voice_expired"
+    DROPPED = "dropped"
+    DISMISSED = "dismissed"
+    AWAITING_RESIDENT = "awaiting_resident"
+    ESCALATED_NO_REPLY = "escalated_no_reply"
+    SENSOR_FAULT = "sensor_fault"
     NO_ACTION = "no_action"
     PROPOSED = "proposed"
     APPROVED = "approved"

@@ -1,22 +1,21 @@
 """Standalone Resident In-Home Device Terminal (Streamlit App).
 
 This app acts as the elderly person's in-home hardware device:
-- Plays voice prompts received from the Agent over speaker via Google Translate TTS.
-- Allows recording resident audio via microphone and transcribing via Orange KB-Whisper Large.
+- Plays prompts with a Swedish browser voice or explicit Google Translate demo fallback.
+- Captures resident audio for backend-only Orange KB-Whisper transcription.
 - Submits resident voice response back to the AURA Multi-Agent pipeline.
 """
 
 import base64
-import hashlib
 from io import BytesIO
 import os
 from pathlib import Path
 import sys
-import time
 
 from gtts import gTTS
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Ensure repository root is on sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -43,250 +42,157 @@ def _load_env() -> None:
 _load_env()
 
 API_BASE_URL = os.environ.get("AURA_API_URL", "http://localhost:8000").rstrip("/")
-KB_WHISPER_URL = os.environ.get(
-    "KB_WHISPER_URL",
-    "https://kb-whisper-batched-vdr-tieto-poc-fa09560c.caas.mandarine-business.cloud/",
-).rstrip("/")
-KB_WHISPER_MODEL = os.environ.get("KB_WHISPER_MODEL", "KBLab/kb-whisper-large")
+SUBJECT_ID = os.environ.get("AURA_SUBJECT_ID", "synthetic-resident-1").strip()
+speaker_component = components.declare_component(
+    "aura_resident_speaker",
+    path=str(_PROJECT_ROOT / "aura" / "voice" / "speaker_frontend"),
+)
 
 st.set_page_config(
-    page_title="AURA Hemterminal",
-    page_icon="🏡",
+    page_title="Resident Check-in",
     layout="centered",
 )
 
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background-color: #080c14;
-        color: #f1f5f9;
-    }
-    .header-box {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 16px;
-        padding: 20px 24px;
-        margin-bottom: 24px;
-    }
-    .prompt-box {
-        background: rgba(14, 28, 48, 0.7);
-        border: 1px solid rgba(56, 189, 248, 0.3);
-        border-radius: 16px;
-        padding: 24px;
-        text-align: center;
-        margin: 16px 0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Header
-st.markdown(
-    """
-    <div class="header-box">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-                <h2 style="margin:0; font-weight:300; letter-spacing:0.5px;">🏡 AURA Hemterminal</h2>
-                <span style="font-size:12px; color:#94a3b8;">Trygghetsassistent för äldreboende & hemvård</span>
-            </div>
-            <div style="text-align:right;">
-                <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background-color:#10b981; margin-right:6px;"></span>
-                <span style="font-size:12px; color:#10b981; font-weight:500;">Ansluten</span>
-            </div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.title("Resident check-in")
+st.caption("AURA home-care demo")
 
 # Function to synthesize Swedish speech via Google Translate TTS
 def generate_tts_audio_bytes(text: str) -> bytes:
     buf = BytesIO()
-    tts = gTTS(text=text.strip(), lang="sv", slow=False)
+    tts = gTTS(text=text.strip(), lang="sv", slow=False, timeout=(5, 20))
     tts.write_to_fp(buf)
     buf.seek(0)
     return buf.getvalue()
 
 
-# Function to transcribe via Orange KB-Whisper API
-def transcribe_audio_kb_whisper(audio_bytes: bytes) -> str:
-    api_key = os.environ.get("ORANGE_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("ORANGE_API_KEY saknas i .env filen.")
-
-    response = requests.post(
-        f"{KB_WHISPER_URL}/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": ("resident_recording.wav", audio_bytes, "audio/wav")},
-        data={
-            "model": KB_WHISPER_MODEL,
-            "language": "sv",
-            "response_format": "json",
-        },
-        timeout=(15, 60),
-    )
-    response.raise_for_status()
-    result = response.json()
-    text = result.get("text", "")
-    if not isinstance(text, str):
-        raise ValueError("Ogiltigt svar från transkriberingstjänsten.")
-    return text.strip()
-
-
 # Function to poll backend for agent prompt
 def fetch_agent_prompt():
     try:
-        res = requests.get(f"{API_BASE_URL}/api/device/prompt", timeout=3)
-        if res.ok:
-            return res.json().get("prompt")
-    except Exception:
-        pass
-    return None
+        res = requests.get(
+            f"{API_BASE_URL}/api/device/prompt",
+            params={"subject_id": SUBJECT_ID}, timeout=5,
+        )
+        res.raise_for_status()
+        return res.json()
+    except (requests.RequestException, ValueError):
+        return None
 
 
 # Function to send response back to Aura Agent Pipeline
-def send_response_to_aura(transcript: str, audio_bytes: bytes = None):
-    try:
-        files = {}
-        if audio_bytes:
-            files["audio_file"] = ("reply.wav", audio_bytes, "audio/wav")
-        data = {"text_response": transcript}
-        res = requests.post(
-            f"{API_BASE_URL}/api/device/respond",
-            data=data,
-            files=files if files else None,
-            timeout=15,
-        )
-        if res.ok:
-            return res.json()
-    except Exception as e:
-        st.error(f"Kunde inte kontakta AURA Dashboard: {e}")
-    return None
+def send_response_to_aura(prompt, audio_bytes: bytes):
+    res = requests.post(
+        f"{API_BASE_URL}/api/device/respond",
+        data={key: prompt[key] for key in ("subject_id", "event_id", "conversation_id")},
+        files={"audio_file": ("reply.wav", audio_bytes, "audio/wav")},
+        timeout=(10, 180),
+    )
+    return res
 
 
-# Fetch prompt
-prompt_data = fetch_agent_prompt()
+def render_speaker(prompt):
+    conversation_id = prompt["conversation_id"] if prompt else None
+    if st.session_state.get("speaker_conversation") != conversation_id:
+        st.session_state["speaker_conversation"] = conversation_id
+        st.session_state.pop("speaker_audio", None)
+        st.session_state.pop("speaker_fallback_error", None)
+    receipt = speaker_component(
+        prompt=prompt,
+        audio_base64=st.session_state.get("speaker_audio"),
+        fallback_error=st.session_state.get("speaker_fallback_error", False),
+        key="resident-speaker",
+        default=None,
+    )
+    if not prompt or not isinstance(receipt, dict):
+        return
+    if any(receipt.get(key) != prompt[key] for key in ("subject_id", "event_id", "conversation_id")):
+        return
+    notification_id = receipt.get("notification_id")
+    if not notification_id or notification_id == st.session_state.get("speaker_notification"):
+        return
+    if receipt.get("action") == "fallback":
+        st.session_state["speaker_notification"] = notification_id
+        try:
+            audio = generate_tts_audio_bytes(prompt["text"])
+            st.session_state["speaker_audio"] = base64.b64encode(audio).decode("ascii")
+            st.session_state["speaker_fallback_error"] = False
+        except Exception:
+            st.session_state["speaker_fallback_error"] = True
+        st.rerun(scope="fragment")
+    elif receipt.get("action") == "playback":
+        try:
+            response = requests.post(
+                f"{API_BASE_URL}/api/device/playback",
+                json={key: receipt.get(key) for key in ("subject_id", "event_id", "conversation_id", "provider", "status")},
+                timeout=5,
+            )
+            if response.ok or response.status_code == 409:
+                st.session_state["speaker_notification"] = notification_id
+            else:
+                st.warning("Playback status could not be confirmed by the server.")
+        except requests.RequestException:
+            st.warning("Playback status could not be confirmed by the server.")
 
-default_text = "Hej. Vi har märkt en avvikelse i sensorerna hemma hos dig. Är allt bra? Berätta gärna om du behöver hjälp."
-agent_message = prompt_data.get("text") if prompt_data else default_text
 
-# 1. HÖGTALARE (Agent Speaker Output)
-st.subheader("🔊 Högtalare från vårdassistenten")
-st.markdown(
-    f"""
-    <div class="prompt-box">
-        <p style="font-size:18px; font-weight:300; margin:0; line-height:1.6; color:#e0f2fe;">
-            "{agent_message}"
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Play TTS audio button & player
-col_audio1, col_audio2 = st.columns([1, 2])
-with col_audio1:
-    if st.button("▶️ Läs upp meddelande (Google TTS)", use_container_width=True):
-        st.session_state["tts_audio"] = generate_tts_audio_bytes(agent_message)
-
-if "tts_audio" not in st.session_state:
-    st.session_state["tts_audio"] = generate_tts_audio_bytes(agent_message)
-
-st.audio(st.session_state["tts_audio"], format="audio/mp3", autoplay=False)
-
-st.divider()
-
-# 2. MIKROFON (Resident Voice Recording)
-st.subheader("🎙️ Tala in ditt svar")
-st.caption("Tryck på mikrofonknappen nedan för att spela in ditt svar till vårdteamet:")
-
-recording = st.audio_input("Spela in röstsvar (svenska)")
-
-if recording is not None:
-    audio_bytes = recording.getvalue()
-    rec_hash = hashlib.sha256(audio_bytes).hexdigest()
-
-    if rec_hash != st.session_state.get("last_rec_hash"):
-        st.session_state["last_rec_hash"] = rec_hash
-        st.session_state["transcribed_text"] = ""
-        st.session_state["sent_result"] = None
-
-        with st.spinner("Transkriberar röst via KB-Whisper Large..."):
+@st.fragment(run_every="3s")
+def resident_conversation():
+    response = fetch_agent_prompt()
+    prompt = response.get("prompt") if response else None
+    render_speaker(prompt)
+    if response is None:
+        st.error("Cannot connect to AURA. Please try again shortly.")
+        return
+    previous = st.session_state.get("sent_result")
+    if previous:
+        st.success("Your reply was received.")
+        st.write(previous["transcript"])
+    if prompt is None:
+        st.info("No check-in is waiting right now.")
+        return
+    conversation_id = prompt["conversation_id"]
+    st.subheader("Message")
+    with st.container(border=True):
+        st.text(prompt["text"])
+        remaining_seconds = prompt.get("remaining_reply_seconds")
+        if isinstance(remaining_seconds, int) and not isinstance(remaining_seconds, bool):
+            minutes, seconds = divmod(max(0, remaining_seconds), 60)
+            st.caption(f"Time remaining: {minutes:02d}:{seconds:02d}")
+    st.subheader("Your reply")
+    if not response.get("whisper_configured"):
+        st.warning("The reply service is not configured on the server.")
+        return
+    recording = st.audio_input("Record your reply", sample_rate=16000, key=f"record-{conversation_id}")
+    if recording is not None and st.button("Send reply", key=f"send-{conversation_id}"):
+        with st.spinner("Transcribing and sending your reply..."):
             try:
-                transcript = transcribe_audio_kb_whisper(audio_bytes)
-                st.session_state["transcribed_text"] = transcript
-                st.success(f"Transkriberat: **\"{transcript}\"**")
+                reply = send_response_to_aura(prompt, recording.getvalue())
+                payload = reply.json()
+                if reply.ok:
+                    st.session_state["sent_result"] = payload
+                    st.rerun(scope="fragment")
+                else:
+                    st.error(payload.get("detail", "Your reply could not be sent. Please try again."))
+            except (requests.RequestException, ValueError):
+                st.error("Your reply could not be sent. Please retry the same recording.")
 
-                # Send directly to Aura workflow
-                with st.spinner("Skickar svar till AURA handläggning..."):
-                    result = send_response_to_aura(transcript, audio_bytes)
-                    if result:
-                        st.session_state["sent_result"] = result
-            except Exception as err:
-                st.warning(f"KB-Whisper transkribering misslyckades ({err}). Du kan använda snabbknapparna nedan.")
 
-# Quick response fallback buttons
-st.markdown("**Eller välj ett snabbsvar med ett klick:**")
-qcol1, qcol2, qcol3 = st.columns(3)
-
-with qcol1:
-    if st.button("🟢 Allt är bra", use_container_width=True):
-        reply_txt = "Jag mår bra, oroa dig inte. Det var ett misstag."
-        st.session_state["transcribed_text"] = reply_txt
-        res = send_response_to_aura(reply_txt)
-        st.session_state["sent_result"] = res
-
-with qcol2:
-    if st.button("🔴 Jag behöver hjälp", use_container_width=True):
-        reply_txt = "Jag har ramlat och behöver hjälp med en gång."
-        st.session_state["transcribed_text"] = reply_txt
-        res = send_response_to_aura(reply_txt)
-        st.session_state["sent_result"] = res
-
-with qcol3:
-    if st.button("🟡 Glömde dörren", use_container_width=True):
-        reply_txt = "Dörren stod visst lite öppen, jag stänger den nu."
-        st.session_state["transcribed_text"] = reply_txt
-        res = send_response_to_aura(reply_txt)
-        st.session_state["sent_result"] = res
-
-# Display outcome from Agent processing
-sent_result = st.session_state.get("sent_result")
-if sent_result:
-    st.markdown("---")
-    outcome_val = sent_result.get("outcome", "ok")
-    if outcome_val == "dispatched":
-        st.success(
-            f"✅ Svar mottaget av vårdteamet! Ärende skapat: **{sent_result.get('ticket_id')}**"
-        )
-    else:
-        st.info(f"ℹ️ Svar registrerat (Utfall: {outcome_val})")
+resident_conversation()
 
 # Demo triggers in sidebar
 with st.sidebar:
-    st.subheader("⚙️ Enhetsinställningar")
-    orange_key = os.environ.get("ORANGE_API_KEY", "").strip()
-    if orange_key:
-        st.success("🟢 ORANGE_API_KEY aktiv")
-    else:
-        st.warning("⚠️ ORANGE_API_KEY saknas i .env")
-
-    st.markdown("---")
-    st.subheader("⚡ Demo Larmtriggers")
-    if st.button("❄️ Trigga köldlarm (-20°C)"):
-        try:
-            r = requests.post(f"{API_BASE_URL}/api/device/trigger-prompt", json={"scenario": "critical-cold"}, timeout=5)
-            if r.ok:
-                st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    if st.button("🚪 Trigga dörrlarm"):
-        try:
-            r = requests.post(f"{API_BASE_URL}/api/device/trigger-prompt", json={"scenario": "door-open"}, timeout=5)
-            if r.ok:
-                st.rerun()
-        except Exception as e:
-            st.error(str(e))
+    st.caption(f"Demo resident: {SUBJECT_ID}")
+    with st.expander("Demo alerts"):
+        for label, scenario in (
+            ("Critical cold", "critical-cold"),
+            ("Door open", "door-open"),
+        ):
+            if st.button(label, key=f"trigger-{scenario}", use_container_width=True):
+                try:
+                    result = requests.post(
+                        f"{API_BASE_URL}/api/device/trigger-prompt",
+                        json={"scenario": scenario},
+                        timeout=5,
+                    )
+                    result.raise_for_status()
+                    st.rerun()
+                except requests.RequestException:
+                    st.error("The demo alert could not be started.")

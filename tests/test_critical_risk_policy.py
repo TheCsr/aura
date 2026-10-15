@@ -4,17 +4,20 @@ from datetime import datetime, timezone
 from aura.agents.critical_risk_policy import CriticalRiskPolicy, CriticalRiskThresholds
 from aura.agents.guardian import GuardianAgent
 from aura.contracts import (
+    AssessmentSeverity,
     ActionProposal,
     Assessment,
     DecisionStatus,
     EvidenceItem,
     InputEvent,
+    Transcript,
+    TriageStage,
 )
 from aura.composition import create_demo_system
 from aura.graph import WorkflowOutcome
 
 
-def make_event(**overrides):
+def make_event(*, transcript=None, **overrides):
     observations = {
         "temperature_c": 20.0,
         "humidity_pct": 45.0,
@@ -28,16 +31,20 @@ def make_event(**overrides):
         subject_id="synthetic-resident-1",
         source="test-sensors",
         observations=observations,
+        transcript=transcript,
     )
 
 
-def make_assessment(event, *, is_anomaly=True, requires_review=False, confidence=0.9):
+def make_assessment(
+    event, *, is_anomaly=True, requires_review=False, confidence=0.9, severity=None
+):
     return Assessment(
         event_id=event.event_id,
         is_anomaly=is_anomaly,
         requires_review=requires_review,
         summary="Synthetic sensor assessment",
         confidence=confidence,
+        severity=severity,
         evidence=(
             EvidenceItem(
                 source="supervisor",
@@ -48,7 +55,13 @@ def make_assessment(event, *, is_anomaly=True, requires_review=False, confidence
     )
 
 
-def make_proposal(event, *, action_type="request_human_review", confidence=0.9):
+def make_proposal(
+    event,
+    *,
+    action_type="request_human_review",
+    confidence=0.9,
+    triage_stage=TriageStage.INITIAL,
+):
     return ActionProposal(
         proposal_id="proposal-risk-1",
         event_id=event.event_id,
@@ -56,10 +69,141 @@ def make_proposal(event, *, action_type="request_human_review", confidence=0.9):
         rationale="Request review of the event.",
         confidence=confidence,
         evidence_refs=("supervisor.evidence.0",),
+        triage_stage=triage_stage,
     )
 
 
 class CriticalRiskPolicyTests(unittest.TestCase):
+    def test_noncritical_dismissal_is_approved_but_critical_requires_real_post_reply(self):
+        policy = CriticalRiskPolicy()
+        ordinary_event = make_event()
+        ordinary = policy.evaluate(
+            ordinary_event,
+            make_assessment(ordinary_event, severity=AssessmentSeverity.MODERATE),
+            make_proposal(ordinary_event, action_type="dismiss"),
+        )
+        critical_event = make_event(temperature_c=-20.0)
+        first_pass = policy.evaluate(
+            critical_event,
+            make_assessment(critical_event, severity=AssessmentSeverity.CRITICAL),
+            make_proposal(critical_event, action_type="dismiss", triage_stage=TriageStage.INITIAL),
+        )
+        no_reply = policy.evaluate(
+            critical_event,
+            make_assessment(critical_event, severity=AssessmentSeverity.CRITICAL),
+            make_proposal(critical_event, action_type="dismiss", triage_stage=TriageStage.POST_REPLY),
+        )
+        replied_event = make_event(
+            temperature_c=-20.0,
+            transcript=Transcript("Jag mår bra.", "test-stt", "sv"),
+        )
+        replied = policy.evaluate(
+            replied_event,
+            make_assessment(replied_event, severity=AssessmentSeverity.CRITICAL),
+            make_proposal(replied_event, action_type="dismiss", triage_stage=TriageStage.POST_REPLY),
+        )
+
+        self.assertEqual(ordinary.status, DecisionStatus.APPROVE)
+        self.assertEqual(first_pass.status, DecisionStatus.DENY)
+        self.assertEqual(no_reply.status, DecisionStatus.DENY)
+        self.assertEqual(replied.status, DecisionStatus.APPROVE)
+
+    def test_ask_resident_requires_initial_moderate_or_critical_severity(self):
+        policy = CriticalRiskPolicy()
+        for severity, stage, expected in (
+            (AssessmentSeverity.MODERATE, TriageStage.INITIAL, DecisionStatus.APPROVE),
+            (AssessmentSeverity.CRITICAL, TriageStage.INITIAL, DecisionStatus.APPROVE),
+            (AssessmentSeverity.INFO, TriageStage.INITIAL, DecisionStatus.HOLD),
+            (AssessmentSeverity.MODERATE, TriageStage.POST_REPLY, DecisionStatus.HOLD),
+        ):
+            with self.subTest(severity=severity, stage=stage):
+                event = make_event()
+                decision = policy.evaluate(
+                    event,
+                    make_assessment(event, severity=severity),
+                    make_proposal(event, action_type="ask_resident", triage_stage=stage),
+                )
+                self.assertEqual(decision.status, expected)
+
+    def test_remote_followup_and_home_visit_use_confidence_thresholds(self):
+        policy = CriticalRiskPolicy(CriticalRiskThresholds(
+            minimum_assessment_confidence=0.6,
+            minimum_proposal_confidence=0.7,
+        ))
+        for action in ("remote_followup", "home_visit"):
+            event = make_event()
+            approved = policy.evaluate(
+                event,
+                make_assessment(event, severity=AssessmentSeverity.MODERATE, confidence=0.8),
+                make_proposal(event, action_type=action, confidence=0.8),
+            )
+            held = policy.evaluate(
+                event,
+                make_assessment(event, severity=AssessmentSeverity.MODERATE, confidence=0.5),
+                make_proposal(event, action_type=action, confidence=0.8),
+            )
+            self.assertEqual(approved.status, DecisionStatus.APPROVE)
+            self.assertEqual(held.status, DecisionStatus.HOLD)
+
+    def test_urgent_visit_is_held_as_home_visit_without_critical_support(self):
+        event = make_event()
+
+        decision = CriticalRiskPolicy().evaluate(
+            event,
+            make_assessment(event, severity=AssessmentSeverity.MODERATE),
+            make_proposal(event, action_type="urgent_visit"),
+        )
+
+        self.assertEqual(decision.status, DecisionStatus.HOLD)
+        self.assertEqual(decision.reason_codes, ("urgent_visit_downgraded_to_home_visit",))
+        self.assertIn("home_visit", decision.rationale)
+
+    def test_urgent_visit_is_approved_for_critical_severity_or_reason_code(self):
+        policy = CriticalRiskPolicy()
+        critical_severity_event = make_event()
+        critical_severity = policy.evaluate(
+            critical_severity_event,
+            make_assessment(critical_severity_event, severity=AssessmentSeverity.CRITICAL),
+            make_proposal(critical_severity_event, action_type="urgent_visit"),
+        )
+        critical_reason_event = make_event(temperature_c=-20.0)
+        critical_reason = policy.evaluate(
+            critical_reason_event,
+            make_assessment(critical_reason_event, severity=AssessmentSeverity.MODERATE),
+            make_proposal(critical_reason_event, action_type="urgent_visit"),
+        )
+
+        self.assertEqual(critical_severity.status, DecisionStatus.APPROVE)
+        self.assertEqual(critical_severity.reason_codes, ("critical_severity",))
+        self.assertEqual(critical_reason.status, DecisionStatus.APPROVE)
+        self.assertIn("critical_low_temperature", critical_reason.reason_codes)
+
+    def test_relative_and_planned_visit_actions_require_resident_profile_data(self):
+        event = make_event()
+        assessment = make_assessment(event, severity=AssessmentSeverity.MODERATE)
+        policy_without_profile = CriticalRiskPolicy()
+        for action, reason in (
+            ("notify_relative", "relative_contact_unavailable"),
+            ("attach_to_planned_visit", "planned_visit_unavailable"),
+        ):
+            decision = policy_without_profile.evaluate(
+                event, assessment, make_proposal(event, action_type=action)
+            )
+            self.assertEqual(decision.status, DecisionStatus.HOLD)
+            self.assertEqual(decision.reason_codes, (reason,))
+
+        configured_policy = CriticalRiskPolicy(resident_contexts={
+            event.subject_id: {
+                "relative_contact": {"name": "Synthetic contact", "phone": "demo-only"},
+                "next_planned_visit": "2026-10-16T10:00:00+00:00",
+            }
+        })
+        for action in ("notify_relative", "attach_to_planned_visit"):
+            decision = configured_policy.evaluate(
+                event, assessment, make_proposal(event, action_type=action)
+            )
+            self.assertEqual(decision.status, DecisionStatus.APPROVE)
+
     def test_critical_cold_approves_human_review_with_reason_code(self):
         event = make_event(temperature_c=-10.0)
 

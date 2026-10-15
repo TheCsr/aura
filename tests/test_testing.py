@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from aura.agents.triage import TriageAgent
 from aura.contracts import Assessment, EvidenceItem, InputEvent
+from aura.agents.triage import INITIAL_ACTION_TYPES, POST_REPLY_ACTION_TYPES
 from aura.testing import DeterministicFakeChatModel, InMemoryBaselineStore
 
 
@@ -34,6 +35,78 @@ def make_assessment(event):
 
 
 class DeterministicFakeChatModelTests(unittest.TestCase):
+    def test_fake_produces_deterministic_initial_and_post_reply_outputs(self):
+        model = DeterministicFakeChatModel()
+        initial_prompt = {
+            "allowed_action_types": list(INITIAL_ACTION_TYPES),
+            "context": {
+                "event": {"transcript": None},
+                "supervisor_assessment": {
+                    "evidence": [{"ref": "supervisor.evidence.0"}],
+                },
+            },
+        }
+        post_reply_prompt = {
+            "reply_citation_required": True,
+            "allowed_action_types": list(POST_REPLY_ACTION_TYPES),
+            "context": {
+                "event": {"transcript": {"text": "Jag föll hemma."}},
+                "resident_reply_evidence_ref": "resident.reply.transcript",
+                "supervisor_assessment": {
+                    "evidence": [{"ref": "supervisor.evidence.0"}],
+                },
+            },
+        }
+
+        initial = json.loads(model.complete(system_prompt="", user_prompt=json.dumps(initial_prompt)))
+        post_reply = json.loads(model.complete(system_prompt="", user_prompt=json.dumps(post_reply_prompt)))
+
+        self.assertEqual(initial["action_type"], "ask_resident")
+        self.assertEqual(initial["parameters"]["question_sv"], "Är allt bra hemma?")
+        self.assertEqual(initial["evidence_refs"], ["supervisor.evidence.0"])
+        self.assertEqual(post_reply["action_type"], "remote_followup")
+        self.assertIn('"Jag föll hemma."', post_reply["rationale"])
+        self.assertEqual(
+            post_reply["evidence_refs"],
+            ["supervisor.evidence.0", "resident.reply.transcript"],
+        )
+
+    def test_fake_accepts_per_stage_scripted_proposals(self):
+        model = DeterministicFakeChatModel(scripted_responses={
+            "initial": {
+                "action_type": "dismiss",
+                "rationale": "The supplied baseline evidence supports dismissal.",
+                "confidence": 0.9,
+                "parameters": {},
+            },
+            "post_reply": {
+                "action_type": "home_visit",
+                "rationale": 'Residenten sade "Jag föll", så en uppföljning behövs.',
+                "confidence": 0.95,
+                "parameters": {"priority": "high"},
+            },
+        })
+        prompt = {
+            "reply_citation_required": True,
+            "allowed_action_types": list(POST_REPLY_ACTION_TYPES),
+            "context": {
+                "event": {"transcript": {"text": "Jag föll hemma."}},
+                "resident_reply_evidence_ref": "resident.reply.transcript",
+                "supervisor_assessment": {
+                    "evidence": [{"ref": "supervisor.evidence.0"}],
+                },
+            },
+        }
+
+        response = json.loads(model.complete(system_prompt="", user_prompt=json.dumps(prompt)))
+
+        self.assertEqual(response["action_type"], "home_visit")
+        self.assertEqual(response["parameters"], {"priority": "high"})
+        self.assertEqual(
+            response["evidence_refs"],
+            ["supervisor.evidence.0", "resident.reply.transcript"],
+        )
+
     def test_repeated_triage_inputs_produce_the_same_proposal(self):
         event = make_event()
         assessment = make_assessment(event)

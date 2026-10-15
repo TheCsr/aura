@@ -57,6 +57,7 @@ def create_demo_system(
         raise ValueError("provide either baselines or baseline_store, not both")
 
     real_llm = llm_from_environment()
+    reasoning_llm = llm_from_environment(model_setting="OPENAI_REASONING_MODEL")
     selected_baseline_store = (
         baseline_store
         if baseline_store is not None
@@ -73,7 +74,7 @@ def create_demo_system(
         else LlmAssessmentStrategy(
             assessment_model
             if assessment_model is not None
-            else real_llm
+            else reasoning_llm
             or DeterministicFakeAssessmentChatModel(numeric_tolerances=numeric_tolerances),
             numeric_tolerances=numeric_tolerances,
         )

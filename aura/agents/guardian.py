@@ -54,6 +54,8 @@ class ProposalEvidenceValidator:
         available_refs = {
             f"supervisor.evidence.{index}" for index in range(len(assessment.evidence))
         }
+        if event.transcript is not None:
+            available_refs.add("resident.reply.transcript")
         if not proposal.evidence_refs:
             errors.append("proposal_missing_evidence")
         elif len(set(proposal.evidence_refs)) != len(proposal.evidence_refs):

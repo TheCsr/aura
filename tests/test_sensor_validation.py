@@ -1,10 +1,12 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from aura.contracts import InputEvent
 from aura.sensors import (
     DoorState,
     SensorEventValidator,
+    SensorQualityMonitor,
     SensorValidationError,
     ValidatedSensorEventHandler,
     ValidatedSensorEventPublisher,
@@ -130,6 +132,82 @@ class SensorEventValidatorTests(unittest.TestCase):
             SensorEventValidator(temperature_min_c=float("nan"))
         with self.assertRaisesRegex(ValueError, "must be a boolean"):
             SensorEventValidator(allow_additional_observations=1)
+
+
+class SensorQualityMonitorTests(unittest.TestCase):
+    def make_quality_event(self, event_id, second, temperature=20.0, **overrides):
+        observations = {
+            "temperature_c": temperature,
+            "humidity_pct": 40.0,
+            "door_state": "closed",
+            "motion_detected": False,
+        }
+        observations.update(overrides)
+        return InputEvent(
+            event_id=event_id,
+            occurred_at=datetime(2026, 10, 11, 0, 0, second, tzinfo=timezone.utc),
+            subject_id="synthetic-resident-1",
+            source="room-sensor",
+            observations=observations,
+        )
+
+    def test_missing_required_fields_are_quality_findings(self):
+        event = self.make_quality_event("quality-missing", 0)
+        event.observations.pop("humidity_pct")
+
+        findings = SensorQualityMonitor().inspect(event)
+
+        self.assertEqual([(finding.code, finding.field) for finding in findings], [
+            ("missing_field", "humidity_pct"),
+        ])
+
+    def test_physical_range_and_configured_rate_jump_are_flagged(self):
+        monitor = SensorQualityMonitor(max_change_per_second={"temperature_c": 0.1})
+        first = self.make_quality_event("quality-first", 0)
+        second = self.make_quality_event("quality-jump", 1, temperature=21.0)
+        impossible = self.make_quality_event("quality-range", 2, temperature=101.0)
+
+        self.assertEqual(monitor.inspect(first), ())
+        self.assertEqual(monitor.inspect(second)[0].code, "impossible_jump")
+        self.assertEqual(monitor.inspect(impossible)[0].code, "impossible_reading")
+
+    def test_configured_repeated_identical_values_are_flagged(self):
+        monitor = SensorQualityMonitor(repeated_value_limit={"temperature_c": 3})
+
+        monitor.inspect(self.make_quality_event("quality-repeat-1", 0))
+        monitor.inspect(self.make_quality_event("quality-repeat-2", 1))
+        findings = monitor.inspect(self.make_quality_event("quality-repeat-3", 2))
+        after_threshold = monitor.inspect(self.make_quality_event("quality-repeat-4", 3))
+
+        self.assertEqual(findings[0].code, "repeated_identical_value")
+        self.assertEqual(findings[0].details["consecutive_readings"], 3)
+        self.assertEqual(after_threshold, ())
+
+    def test_quality_findings_are_idempotent_for_duplicate_event(self):
+        monitor = SensorQualityMonitor()
+        event = self.make_quality_event("quality-duplicate", 0)
+        event.observations.pop("door_state")
+
+        first = monitor.inspect(event)
+        repeated = monitor.inspect(event)
+
+        self.assertEqual(first, repeated)
+
+    def test_invalid_quality_limits_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "positive finite limits"):
+            SensorQualityMonitor(max_change_per_second={"temperature_c": 0})
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            SensorQualityMonitor(repeated_value_limit={"temperature_c": 1})
+
+    def test_quality_limits_can_be_configured_from_json_environment(self):
+        with patch.dict("os.environ", {
+            "AURA_SENSOR_MAX_CHANGE_PER_SECOND": '{"temperature_c":0.2}',
+            "AURA_SENSOR_REPEATED_VALUE_LIMITS": '{"temperature_c":4}',
+        }, clear=True):
+            monitor = SensorQualityMonitor.from_environment()
+
+        self.assertEqual(monitor._max_change_per_second, {"temperature_c": 0.2})
+        self.assertEqual(monitor._repeated_value_limit, {"temperature_c": 4})
 
 
 class SensorValidationBoundaryTests(unittest.TestCase):

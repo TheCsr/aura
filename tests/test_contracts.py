@@ -2,6 +2,8 @@ import unittest
 from datetime import datetime, timezone
 
 from aura.contracts import (
+    ACTION_CATALOGUE,
+    ActionType,
     ActionProposal,
     Assessment,
     DecisionStatus,
@@ -9,11 +11,24 @@ from aura.contracts import (
     DispatchStatus,
     GuardianDecision,
     InputEvent,
+    TriageStage,
     Transcript,
 )
 
 
 class ContractTests(unittest.TestCase):
+    def test_action_catalogue_is_string_compatible_and_includes_supported_actions(self):
+        self.assertEqual(ACTION_CATALOGUE, tuple(action.value for action in ActionType))
+        self.assertIn("dismiss", ACTION_CATALOGUE)
+        self.assertIn("ask_resident", ACTION_CATALOGUE)
+        self.assertIn("remote_followup", ACTION_CATALOGUE)
+        self.assertIn("home_visit", ACTION_CATALOGUE)
+        self.assertIn("urgent_visit", ACTION_CATALOGUE)
+        self.assertIn("notify_relative", ACTION_CATALOGUE)
+        self.assertIn("attach_to_planned_visit", ACTION_CATALOGUE)
+        self.assertIn("maintenance_ticket", ACTION_CATALOGUE)
+        self.assertEqual(ActionType.REQUEST_HUMAN_REVIEW, "request_human_review")
+
     def test_input_event_accepts_timezone_and_json_observations(self):
         event = InputEvent(
             event_id="evt-1",
@@ -48,6 +63,11 @@ class ContractTests(unittest.TestCase):
                 observations={"unsupported": object()},
             )
 
+    def test_transcript_requires_non_whitespace_text(self):
+        for text in ("", "   ", "\n\t"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "transcript text"):
+                Transcript(text=text, source="test-stt")
+
     def test_assessment_rejects_out_of_range_confidence(self):
         with self.assertRaisesRegex(ValueError, "between 0.0 and 1.0"):
             Assessment(
@@ -75,6 +95,16 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual(decision.event_id, proposal.event_id)
         self.assertEqual(decision.proposal_id, proposal.proposal_id)
+        self.assertEqual(proposal.triage_stage, TriageStage.INITIAL)
+        post_reply_proposal = ActionProposal(
+            proposal_id="proposal-2",
+            event_id="evt-1",
+            action_type="request_human_review",
+            rationale="Resident reply reviewed.",
+            confidence=0.8,
+            triage_stage=TriageStage.POST_REPLY,
+        )
+        self.assertEqual(post_reply_proposal.triage_stage.value, "post_reply")
         self.assertEqual(
             DispatchReceipt(
                 event_id="evt-1",

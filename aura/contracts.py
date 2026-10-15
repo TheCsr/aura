@@ -67,8 +67,7 @@ class Transcript:
     model: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.text, str):
-            raise ValueError("transcript text must be a string")
+        _require_text("transcript text", self.text)
         _require_text("transcript source", self.source)
 
 
@@ -110,6 +109,12 @@ class EvidenceItem:
         _validate_json_object("evidence details", self.details)
 
 
+class AssessmentSeverity(str, Enum):
+    INFO = "info"
+    MODERATE = "moderate"
+    CRITICAL = "critical"
+
+
 @dataclass(frozen=True)
 class Assessment:
     """Supervisor result describing a signal and the evidence behind it."""
@@ -120,6 +125,8 @@ class Assessment:
     confidence: float
     evidence: Tuple[EvidenceItem, ...] = ()
     requires_review: bool = False
+    drop_reason: Optional[str] = None
+    severity: Optional[AssessmentSeverity] = None
 
     def __post_init__(self) -> None:
         _require_text("assessment event_id", self.event_id)
@@ -129,6 +136,32 @@ class Assessment:
             raise ValueError("is_anomaly must be a boolean")
         if not isinstance(self.requires_review, bool):
             raise ValueError("requires_review must be a boolean")
+        if self.drop_reason is not None:
+            _require_text("assessment drop_reason", self.drop_reason)
+        if self.severity is not None and not isinstance(self.severity, AssessmentSeverity):
+            raise ValueError("severity must be an AssessmentSeverity")
+
+
+class ActionType(str, Enum):
+    """Canonical action names that Triage may propose for policy review."""
+
+    DISMISS = "dismiss"
+    ASK_RESIDENT = "ask_resident"
+    REMOTE_FOLLOWUP = "remote_followup"
+    HOME_VISIT = "home_visit"
+    URGENT_VISIT = "urgent_visit"
+    NOTIFY_RELATIVE = "notify_relative"
+    ATTACH_TO_PLANNED_VISIT = "attach_to_planned_visit"
+    MAINTENANCE_TICKET = "maintenance_ticket"
+    REQUEST_HUMAN_REVIEW = "request_human_review"
+
+
+ACTION_CATALOGUE: Tuple[str, ...] = tuple(action.value for action in ActionType)
+
+
+class TriageStage(str, Enum):
+    INITIAL = "initial"
+    POST_REPLY = "post_reply"
 
 
 @dataclass(frozen=True)
@@ -142,6 +175,7 @@ class ActionProposal:
     confidence: float
     parameters: Mapping[str, JsonValue] = field(default_factory=dict)
     evidence_refs: Tuple[str, ...] = ()
+    triage_stage: TriageStage = TriageStage.INITIAL
 
     def __post_init__(self) -> None:
         _require_text("proposal_id", self.proposal_id)
@@ -150,6 +184,8 @@ class ActionProposal:
         _require_text("proposal rationale", self.rationale)
         _validate_confidence(self.confidence)
         _validate_json_object("proposal parameters", self.parameters)
+        if not isinstance(self.triage_stage, TriageStage):
+            raise ValueError("triage_stage must be a TriageStage")
 
 
 class DecisionStatus(str, Enum):

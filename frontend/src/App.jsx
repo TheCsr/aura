@@ -20,7 +20,9 @@ import {
   ChevronRight,
   Eye,
   Sparkles,
-  Layers
+  Layers,
+  BarChart3,
+  MessageCircle
 } from 'lucide-react'
 
 export default function App() {
@@ -29,12 +31,17 @@ export default function App() {
   const [latestResult, setLatestResult] = useState(null)
   const [events, setEvents] = useState([])
   const [tickets, setTickets] = useState([])
+  const [metrics, setMetrics] = useState(null)
+  const [baselineSuggestions, setBaselineSuggestions] = useState([])
+  const [buddies, setBuddies] = useState([])
+  const [buddyRequests, setBuddyRequests] = useState([])
   const [statusMessage, setStatusMessage] = useState(null)
 
   // Ticket filter state
   const [ticketFilter, setTicketFilter] = useState('all')
   const [ticketSearch, setTicketSearch] = useState('')
   const [caregiverNotes, setCaregiverNotes] = useState({})
+  const [feedbackDrafts, setFeedbackDrafts] = useState({})
 
   // Active agent inspect tab
   const [agentInspectTab, setAgentInspectTab] = useState('supervisor')
@@ -45,7 +52,10 @@ export default function App() {
     let timer
 
     const refresh = async () => {
-      await Promise.all([fetchStatus(), fetchLatest(), fetchTickets(), fetchEvents()])
+      await Promise.all([
+        fetchStatus(), fetchLatest(), fetchTickets(), fetchEvents(),
+        fetchMetrics(), fetchBaselineSuggestions(), fetchBuddies(), fetchBuddyRequests(),
+      ])
       if (active) {
         timer = window.setTimeout(refresh, 3000)
       }
@@ -106,6 +116,68 @@ export default function App() {
     }
   }
 
+  const fetchMetrics = async () => {
+    try {
+      const res = await fetch('/api/metrics')
+      if (res.ok) setMetrics(await res.json())
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const fetchBaselineSuggestions = async () => {
+    try {
+      const res = await fetch('/api/baseline-suggestions')
+      if (res.ok) {
+        const data = await res.json()
+        setBaselineSuggestions(data.suggestions || [])
+      }
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const fetchBuddies = async () => {
+    try {
+      const res = await fetch('/api/buddies')
+      if (res.ok) {
+        const data = await res.json()
+        setBuddies(data.buddies || [])
+      }
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const fetchBuddyRequests = async () => {
+    try {
+      const res = await fetch('/api/buddy-requests')
+      if (res.ok) {
+        const data = await res.json()
+        setBuddyRequests(data.requests || [])
+      }
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const handleRequestBuddy = async (buddyId) => {
+    const subjectId = latestResult?.sensor_data?.subject_id || 'synthetic-resident-1'
+    try {
+      const res = await fetch(`/api/buddies/${encodeURIComponent(buddyId)}/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subject_id: subjectId }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Demo buddy request could not be recorded.')
+      await fetchBuddyRequests()
+      setStatusMessage({ type: 'success', text: 'Demo conversation request recorded. No one was contacted.' })
+    } catch (e) {
+      setStatusMessage({ type: 'error', text: e.message })
+    }
+  }
+
   const handleUpdateTicket = async (ticketId, newStatus, notes) => {
     try {
       const body = {}
@@ -121,6 +193,37 @@ export default function App() {
         await Promise.all([fetchTickets(), fetchStatus()])
         setStatusMessage({ type: 'success', text: `Ticket ${ticketId} updated.` })
       }
+    } catch (e) {
+      setStatusMessage({ type: 'error', text: e.message })
+    }
+  }
+
+  const handleSubmitFeedback = async (ticketId) => {
+    const feedback = feedbackDrafts[ticketId]
+    if (!feedback?.label) return
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(feedback),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Feedback could not be saved.')
+      await Promise.all([fetchTickets(), fetchMetrics(), fetchBaselineSuggestions()])
+      setStatusMessage({ type: 'success', text: 'Caseworker feedback saved.' })
+    } catch (e) {
+      setStatusMessage({ type: 'error', text: e.message })
+    }
+  }
+
+  const handleApplyBaselineSuggestion = async (suggestion) => {
+    try {
+      const path = `/api/baseline-suggestions/${encodeURIComponent(suggestion.subject_id)}/${encodeURIComponent(suggestion.field)}/apply`
+      const res = await fetch(path, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Baseline suggestion could not be applied.')
+      await Promise.all([fetchBaselineSuggestions(), fetchMetrics()])
+      setStatusMessage({ type: 'success', text: `Baseline updated for ${suggestion.field}.` })
     } catch (e) {
       setStatusMessage({ type: 'error', text: e.message })
     }
@@ -198,6 +301,39 @@ export default function App() {
                 </span>
               )}
             </button>
+
+            <button
+              onClick={() => setActiveTab('review')}
+              className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-medium transition-all ${
+                activeTab === 'review'
+                  ? 'bg-gradient-to-r from-cyan-500/20 to-indigo-500/20 text-cyan-300 border border-cyan-500/30 shadow-md shadow-cyan-950/40'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+              }`}
+            >
+              <div className="flex items-center gap-3">
+                <BarChart3 className="w-4 h-4" />
+                <span>Dismissed & Metrics</span>
+              </div>
+              {metrics?.dismissed_critical_review > 0 && (
+                <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                  {metrics.dismissed_critical_review}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setActiveTab('buddy')}
+              className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-medium transition-all ${
+                activeTab === 'buddy'
+                  ? 'bg-gradient-to-r from-cyan-500/20 to-indigo-500/20 text-cyan-300 border border-cyan-500/30 shadow-md shadow-cyan-950/40'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+              }`}
+            >
+              <div className="flex items-center gap-3">
+                <MessageCircle className="w-4 h-4" />
+                <span>Buddy</span>
+              </div>
+            </button>
           </nav>
         </div>
 
@@ -232,6 +368,8 @@ export default function App() {
               {activeTab === 'dashboard' && 'Operations Dashboard & Agent Workflow'}
               {activeTab === 'tickets' && 'Caregiver Review & Incident Tickets'}
               {activeTab === 'history' && 'Audited Sensor Telemetry History'}
+              {activeTab === 'review' && 'Dismissed Events & Operations Metrics'}
+              {activeTab === 'buddy' && 'Demo Buddy'}
             </h2>
           </div>
           <div className="flex items-center gap-3">
@@ -241,6 +379,10 @@ export default function App() {
                 fetchLatest()
                 fetchTickets()
                 fetchEvents()
+                fetchMetrics()
+                fetchBaselineSuggestions()
+                fetchBuddies()
+                fetchBuddyRequests()
               }}
               className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
               title="Refresh State"
@@ -288,6 +430,9 @@ export default function App() {
               search={ticketSearch}
               setSearch={setTicketSearch}
               onUpdateTicket={handleUpdateTicket}
+              onSubmitFeedback={handleSubmitFeedback}
+              feedbackDrafts={feedbackDrafts}
+              setFeedbackDrafts={setFeedbackDrafts}
               notesState={caregiverNotes}
               setNotesState={setCaregiverNotes}
             />
@@ -295,6 +440,24 @@ export default function App() {
 
           {activeTab === 'history' && (
             <HistoryView events={events} />
+          )}
+
+          {activeTab === 'review' && (
+            <DismissedMetricsView
+              events={events}
+              metrics={metrics}
+              baselineSuggestions={baselineSuggestions}
+              onApplyBaselineSuggestion={handleApplyBaselineSuggestion}
+            />
+          )}
+
+          {activeTab === 'buddy' && (
+            <BuddyView
+              buddies={buddies}
+              requests={buddyRequests}
+              subjectId={latestResult?.sensor_data?.subject_id || 'synthetic-resident-1'}
+              onRequest={handleRequestBuddy}
+            />
           )}
         </div>
       </main>
@@ -359,20 +522,35 @@ function DashboardView({
   // Auto-focus the terminal agent when outcome changes
   useEffect(() => {
     if (!latestResult) return
-    if (latestResult.outcome === 'dispatched') {
+    if (latestResult.outcome === 'awaiting_resident' || latestResult.outcome === 'waiting_for_resident' || latestResult.outcome === 'voice_expired') {
+      setSelectedAgent('voice')
+    } else if (latestResult.outcome === 'sensor_fault') {
+      setSelectedAgent('dispatcher')
+    } else if (latestResult.outcome === 'dispatched' || latestResult.outcome === 'escalated_no_reply') {
       setSelectedAgent('dispatcher')
     } else if (latestResult.outcome === 'held' || latestResult.outcome === 'denied') {
       setSelectedAgent('guardian')
+    } else if (latestResult.outcome === 'dismissed') {
+      setSelectedAgent('triage')
     } else if (latestResult.outcome === 'no_action') {
       setSelectedAgent('supervisor')
+    } else if (latestResult.outcome === 'dropped') {
+      setSelectedAgent('supervisor')
     }
-  }, [latestResult?.event_id])
+  }, [latestResult?.event_id, latestResult?.outcome])
 
   const hasEvent = Boolean(latestResult)
   const outcome = latestResult?.outcome ?? 'waiting'
   const isAnomaly = Boolean(latestResult?.supervisor?.is_anomaly || latestResult?.supervisor?.requires_review)
-  const voiceExecuted = Boolean(latestResult?.voice_prompt)
+  const waitingForResident = outcome === 'awaiting_resident' || outcome === 'waiting_for_resident'
+  const voiceExpired = outcome === 'voice_expired'
+  const escalatedNoReply = outcome === 'escalated_no_reply'
+  const voiceExecuted = Boolean(latestResult?.resident_reply)
   const triageExecuted = Boolean(latestResult?.triage)
+  const triagePasses = latestResult?.triage_passes?.length
+    ? latestResult.triage_passes
+    : latestResult?.triage ? [latestResult.triage] : []
+  const voiceSkipped = hasEvent && !waitingForResident && !voiceExecuted && !voiceExpired && !escalatedNoReply
   const guardianStatus = latestResult?.guardian?.status
   const isApproved = guardianStatus === 'approve'
   const isHeld = guardianStatus === 'hold'
@@ -384,12 +562,47 @@ function DashboardView({
   const lastCriticalResult = visibleEvents.find((event) => {
     const reasonCodes = event.guardian?.reason_codes || []
     return event.guardian?.status === 'approve' && reasonCodes.some(
-      (reason) => reason.startsWith('critical_') || reason === 'door_open_without_motion',
+      (reason) => reason.startsWith('critical_')
+        || reason === 'door_open_without_motion'
+        || reason === 'resident_reply_distress',
     )
   }) || null
 
   // Scandinavian Status Palette
   const outcomeMeta = {
+    awaiting_resident: {
+      badge: 'WAITING FOR RESIDENT REPLY',
+      tagColor: 'text-cyan-300 border-cyan-500/30 bg-cyan-950/20',
+      icon: Mic,
+    },
+    waiting_for_resident: {
+      badge: 'WAITING FOR RESIDENT REPLY',
+      tagColor: 'text-cyan-300 border-cyan-500/30 bg-cyan-950/20',
+      icon: Mic,
+    },
+    voice_expired: {
+      badge: 'REPLY TIMED OUT · NO AUTOMATIC DISPATCH',
+      tagColor: 'text-amber-300 border-amber-500/30 bg-amber-950/20',
+      icon: AlertTriangle,
+    },
+    escalated_no_reply: {
+      badge: 'NO REPLY · FOLLOW-UP ESCALATED',
+      tagColor: 'text-amber-300 border-amber-500/30 bg-amber-950/20',
+      accentColor: '#f59e0b',
+      halo: 'shadow-amber-500/20',
+      desc: latestResult?.triage?.action_type === 'urgent_visit'
+        ? 'No reply arrived before the critical deadline; Guardian approved an urgent follow-up.'
+        : 'No reply arrived before the moderate deadline; Guardian approved a remote follow-up.',
+      icon: AlertTriangle,
+    },
+    sensor_fault: {
+      badge: 'SENSOR FAULT · MAINTENANCE TICKET',
+      tagColor: 'text-amber-300 border-amber-500/30 bg-amber-950/20',
+      accentColor: '#f59e0b',
+      halo: 'shadow-amber-500/20',
+      desc: 'Sensor-quality evidence was routed to maintenance; no resident visit was requested.',
+      icon: AlertTriangle,
+    },
     dispatched: {
       badge: 'DISPATCHED · INTERVENTION APPROVED',
       nordicText: 'Åtgärd Godkänd & Skickad',
@@ -406,6 +619,26 @@ function DashboardView({
       accentColor: '#94a3b8',
       halo: 'shadow-slate-500/10',
       desc: 'Telemetry aligns with the resident baseline. Task dropped at Supervisor.',
+      icon: Info,
+    },
+    dropped: {
+      badge: latestResult?.supervisor?.drop_reason === 'awaiting_persistence'
+        ? 'WAITING FOR CONFIRMATION · READING DEBOUNCED'
+        : 'REPEATED ANOMALY SUPPRESSED',
+      tagColor: 'text-amber-300 border-amber-500/30 bg-amber-950/20',
+      accentColor: '#f59e0b',
+      halo: 'shadow-amber-500/20',
+      desc: latestResult?.supervisor?.drop_reason === 'awaiting_persistence'
+        ? 'One more consecutive non-critical reading is required before follow-up.'
+        : 'This anomaly is already being handled for the resident.',
+      icon: AlertTriangle,
+    },
+    dismissed: {
+      badge: 'DISMISSED · NO FOLLOW-UP ACTION',
+      tagColor: 'text-slate-300 border-white/10 bg-slate-900/40',
+      accentColor: '#94a3b8',
+      halo: 'shadow-slate-500/10',
+      desc: latestResult?.triage?.rationale || 'Triage dismissed the event; the reason is retained in event history.',
       icon: Info,
     },
     held: {
@@ -454,14 +687,14 @@ function DashboardView({
     },
     {
       id: 'voice',
-      name: 'Resident Voice',
-      role: 'Speech & Acoustic Dialogue',
+      name: 'Resident check-in',
+      role: 'If Triage asks',
       swedishRole: 'Röst & Akustik',
       icon: Mic,
-      flowing: voiceExecuted,
-      dropped: false,
-      passToNext: voiceExecuted,
-      statusLabel: !hasEvent ? 'Waiting' : voiceExecuted ? 'Dialogue Verified' : 'Bypassed',
+      flowing: waitingForResident || voiceExecuted,
+      dropped: voiceExpired || voiceSkipped,
+      passToNext: voiceExecuted || escalatedNoReply,
+      statusLabel: !hasEvent ? 'Waiting' : voiceSkipped ? 'Skipped · not requested' : waitingForResident ? 'Awaiting reply' : escalatedNoReply ? 'Escalated · No reply' : voiceExpired ? 'Reply expired' : voiceExecuted ? 'Reply received' : 'Bypassed',
       color: '#818cf8', // Lavender mist
     },
     {
@@ -473,7 +706,7 @@ function DashboardView({
       flowing: triageExecuted,
       dropped: false,
       passToNext: triageExecuted,
-      statusLabel: !hasEvent ? 'Waiting' : triageExecuted ? 'Proposal Bound' : 'Bypassed',
+      statusLabel: !hasEvent ? 'Waiting' : triageExecuted ? `${triagePasses.length} Triage pass${triagePasses.length === 1 ? '' : 'es'}` : 'Bypassed',
       color: '#c084fc', // Soft heather
     },
     {
@@ -497,7 +730,7 @@ function DashboardView({
       flowing: !!ticketId,
       dropped: false,
       passToNext: false,
-      statusLabel: !hasEvent ? 'Waiting' : ticketId ? 'Ticket Dispatched' : 'No Action',
+      statusLabel: !hasEvent || waitingForResident ? 'Waiting' : ticketId ? 'Ticket Dispatched' : 'No Action',
       color: '#10b981', // Scandinavian forest green
     },
   ]
@@ -709,6 +942,7 @@ function DashboardView({
                       </span>
                     </div>
 
+                    {latestResult.resident_reply ? (
                     <div className="p-4 rounded-2xl bg-slate-950/40 border border-white/[0.05] space-y-1.5">
                       <span className="text-[10px] font-mono uppercase text-slate-400 tracking-wider">
                         Transcribed Resident Response
@@ -720,6 +954,11 @@ function DashboardView({
                         Source: {latestResult.resident_reply?.transcript_source}
                       </span>
                     </div>
+                    ) : (
+                      <p className="py-4 text-sm text-slate-400">
+                        {escalatedNoReply ? `No reply arrived. Guardian approved ${latestResult.triage?.action_type || 'follow-up'}.` : voiceExpired ? 'No reply arrived before the deadline. No action was dispatched.' : 'Triage requested a resident check-in. Waiting for the resident device to send a recorded reply.'}
+                      </p>
+                    )}
 
                     {latestResult.resident_reply?.acoustic_features && (
                       <div className="p-3 rounded-xl bg-slate-900/40 border border-white/[0.04] text-xs space-y-2">
@@ -750,6 +989,13 @@ function DashboardView({
               <div className="space-y-4">
                 {latestResult.triage ? (
                   <>
+                    <div className="flex flex-wrap gap-2">
+                      {triagePasses.map((proposal, index) => (
+                        <span key={proposal.proposal_id || index} className="px-2.5 py-1 rounded border border-purple-500/20 bg-purple-950/20 text-[10px] font-mono text-purple-200">
+                          {proposal.triage_stage === 'post_reply' ? 'Post-reply' : 'Initial'}: {proposal.action_type}
+                        </span>
+                      ))}
+                    </div>
                     <div className="p-4 rounded-2xl bg-slate-950/40 border border-white/[0.05] space-y-2">
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] font-mono uppercase text-slate-400 tracking-wider">
@@ -888,7 +1134,9 @@ function DashboardView({
               </button>
               {showRawJson && (
                 <pre className="mt-2 p-3 rounded-xl bg-black/60 border border-white/[0.06] text-[10px] font-mono text-cyan-300/80 overflow-x-auto max-h-48">
-                  {JSON.stringify(latestResult[selectedAgent] || latestResult, null, 2)}
+                  {JSON.stringify(selectedAgent === 'voice'
+                    ? { prompt: latestResult.voice_prompt, reply: latestResult.resident_reply }
+                    : latestResult[selectedAgent] ?? null, null, 2)}
                 </pre>
               )}
             </div>
@@ -908,6 +1156,9 @@ function TicketsView({
   search,
   setSearch,
   onUpdateTicket,
+  onSubmitFeedback,
+  feedbackDrafts,
+  setFeedbackDrafts,
   notesState,
   setNotesState,
 }) {
@@ -1010,8 +1261,20 @@ function TicketsView({
                       <span className="font-mono text-sm font-bold text-cyan-400">
                         {ticket.record_id}
                       </span>
+                      <span className="px-2 py-0.5 rounded border border-slate-700 text-[11px] uppercase text-slate-300">
+                        {{
+                          request_human_review: 'Human review',
+                          maintenance_ticket: 'Maintenance',
+                          remote_followup: 'Remote follow-up',
+                          home_visit: 'Home visit',
+                          urgent_visit: 'Urgent visit',
+                        }[ticket.action_type] || ticket.action_type}
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        {ticket.triage_stage === 'post_reply' ? 'Post-reply pass' : 'Initial pass'}
+                      </span>
                       <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
-                        ticket.priority === 'High'
+                        ticket.priority === 'High' || ticket.priority === 'Urgent'
                           ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                           : 'bg-slate-700/50 text-slate-300'
                       }`}>
@@ -1033,11 +1296,14 @@ function TicketsView({
                       className={`px-3 py-1.5 rounded-xl text-xs font-semibold focus:outline-none border ${
                         ticket.status === 'awaiting_human_review'
                           ? 'bg-amber-950/40 border-amber-500/50 text-amber-300'
+                          : ticket.status === 'maintenance_required'
+                          ? 'bg-amber-950/40 border-amber-500/50 text-amber-300'
                           : ticket.status === 'in_progress'
                           ? 'bg-cyan-950/40 border-cyan-500/50 text-cyan-300'
                           : 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300'
                       }`}
                     >
+                      <option value="maintenance_required">🛠 Maintenance Required</option>
                       <option value="awaiting_human_review">🔴 Awaiting Review</option>
                       <option value="in_progress">🟡 In Progress</option>
                       <option value="resolved">🟢 Resolved</option>
@@ -1049,15 +1315,15 @@ function TicketsView({
                 <div className="grid grid-cols-4 gap-3 p-3 rounded-xl bg-[#090d16] border border-slate-800/80 text-xs">
                   <div>
                     <span className="text-slate-500 block">Temperature:</span>
-                    <strong className="text-white">{ticket.observations?.temperature_c}°C</strong>
+                    <strong className="text-white">{ticket.observations?.temperature_c ?? 'Missing'}°C</strong>
                   </div>
                   <div>
                     <span className="text-slate-500 block">Humidity:</span>
-                    <strong className="text-white">{ticket.observations?.humidity_pct}%</strong>
+                    <strong className="text-white">{ticket.observations?.humidity_pct ?? 'Missing'}%</strong>
                   </div>
                   <div>
                     <span className="text-slate-500 block">Door State:</span>
-                    <strong className="text-white capitalize">{ticket.observations?.door_state}</strong>
+                    <strong className="text-white capitalize">{ticket.observations?.door_state ?? 'Missing'}</strong>
                   </div>
                   <div>
                     <span className="text-slate-500 block">Motion Detected:</span>
@@ -1083,11 +1349,266 @@ function TicketsView({
                     Save Notes
                   </button>
                 </div>
+
+                {ticket.feedback ? (
+                  <p className="text-xs text-slate-400 border-t border-slate-800 pt-3">
+                    Caseworker feedback: <strong className="text-slate-200">{ticket.feedback.label.replaceAll('_', ' ')}</strong>
+                    {ticket.feedback.note ? ` · ${ticket.feedback.note}` : ''}
+                  </p>
+                ) : ticket.status === 'resolved' ? (
+                  <div className="grid gap-3 border-t border-slate-800 pt-3 sm:grid-cols-[180px_1fr_auto]">
+                    <select
+                      aria-label="Caseworker outcome"
+                      value={feedbackDrafts[ticket.record_id]?.label || ''}
+                      onChange={(event) => setFeedbackDrafts({
+                        ...feedbackDrafts,
+                        [ticket.record_id]: {
+                          ...feedbackDrafts[ticket.record_id],
+                          label: event.target.value,
+                        },
+                      })}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200"
+                    >
+                      <option value="">Select outcome</option>
+                      <option value="false_alarm">False alarm</option>
+                      <option value="justified">Justified</option>
+                      <option value="sensor_fault">Sensor fault</option>
+                    </select>
+                    <input
+                      aria-label="Caseworker feedback note"
+                      value={feedbackDrafts[ticket.record_id]?.note || ''}
+                      onChange={(event) => setFeedbackDrafts({
+                        ...feedbackDrafts,
+                        [ticket.record_id]: {
+                          ...feedbackDrafts[ticket.record_id],
+                          note: event.target.value,
+                        },
+                      })}
+                      placeholder="Optional caseworker note"
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 placeholder:text-slate-500"
+                    />
+                    <button
+                      disabled={!feedbackDrafts[ticket.record_id]?.label}
+                      onClick={() => onSubmitFeedback(ticket.record_id)}
+                      className="rounded-lg border border-cyan-500/30 bg-cyan-950/30 px-3 py-2 text-xs font-semibold text-cyan-200 disabled:opacity-40"
+                    >
+                      Save feedback
+                    </button>
+                  </div>
+                ) : (
+                  <p className="border-t border-slate-800 pt-3 text-[11px] text-slate-500">
+                    Resolve this ticket to record caseworker feedback.
+                  </p>
+                )}
               </div>
             )
           })}
         </div>
       )}
+    </div>
+  )
+}
+
+function DismissedMetricsView({
+  events,
+  metrics,
+  baselineSuggestions,
+  onApplyBaselineSuggestion,
+}) {
+  const [dismissedFilter, setDismissedFilter] = useState('critical')
+  const dismissed = events.filter((event) => event.outcome === 'dismissed')
+  const isCriticalDismissal = (event) => (
+    event.supervisor?.severity === 'critical'
+    || (event.guardian?.reason_codes || []).some((reason) => reason.startsWith('critical_'))
+  )
+  const visibleDismissals = dismissed.filter((event) => (
+    dismissedFilter !== 'critical' || isCriticalDismissal(event)
+  ))
+
+  const metricItems = [
+    ['Events', metrics?.events_processed ?? 0, 'text-slate-100'],
+    ['Dropped by debounce', metrics?.dropped ?? 0, 'text-amber-300'],
+    ['Dismissed', metrics?.dismissed ?? 0, 'text-slate-300'],
+    ['Dismissed · critical review', metrics?.dismissed_critical_review ?? 0, 'text-rose-300'],
+    ['Remote follow-ups', metrics?.remote_followups ?? 0, 'text-cyan-300'],
+    ['Home visits', metrics?.home_visits ?? 0, 'text-amber-300'],
+    ['Urgent visits', metrics?.urgent_visits ?? 0, 'text-rose-300'],
+    ['Est. visits avoided', metrics?.estimated_visits_avoided ?? 0, 'text-emerald-300'],
+    ['No-reply escalations', metrics?.escalated_no_reply ?? 0, 'text-orange-300'],
+    ['Sensor faults', metrics?.sensor_faults ?? 0, 'text-yellow-300'],
+    ['False alarms reported', metrics?.false_alarm_feedback ?? 0, 'text-slate-100'],
+    ['False-alarm rate', `${Math.round((metrics?.false_alarm_rate ?? 0) * 100)}%`, 'text-amber-300'],
+  ]
+
+  return (
+    <div className="mx-auto max-w-7xl space-y-8">
+      <section className="space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Dismissed events</h3>
+          <p className="mt-1 text-xs text-slate-500">Critical dismissals remain visible for caseworker review.</p>
+        </div>
+        <div className="flex gap-2" role="group" aria-label="Dismissed event filter">
+          {[
+            { id: 'critical', label: 'Critical · review' },
+            { id: 'all', label: 'All dismissals' },
+          ].map((filter) => (
+            <button
+              key={filter.id}
+              onClick={() => setDismissedFilter(filter.id)}
+              aria-pressed={dismissedFilter === filter.id}
+              className={`rounded-lg border px-3 py-2 text-xs font-medium ${dismissedFilter === filter.id ? 'border-amber-500/40 bg-amber-950/30 text-amber-200' : 'border-slate-700 bg-slate-900 text-slate-400'}`}
+            >
+              {filter.label}
+            </button>
+          ))}
+        </div>
+        {visibleDismissals.length === 0 ? (
+          <p className="rounded-xl border border-slate-800 bg-[#0e1626] p-6 text-sm text-slate-500">
+            No dismissed events match this filter.
+          </p>
+        ) : (
+          <div className="divide-y divide-slate-800 border-y border-slate-800">
+            {visibleDismissals.map((event) => (
+              <article key={event.event_id} className="grid gap-2 py-4 sm:grid-cols-[1fr_auto]">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-xs text-slate-300">{event.event_id}</span>
+                    {isCriticalDismissal(event) && (
+                      <span className="rounded border border-rose-500/30 bg-rose-950/30 px-2 py-0.5 text-[10px] font-semibold uppercase text-rose-300">
+                        Critical · review
+                      </span>
+                    )}
+                    <span className="text-[10px] text-slate-500">{event.supervisor?.severity || 'severity unavailable'}</span>
+                  </div>
+                  <p className="mt-2 text-sm text-slate-200">{event.triage?.rationale || event.supervisor?.summary || 'Dismissed by Triage.'}</p>
+                  <p className="mt-1 text-[11px] text-slate-500">{event.triage?.triage_stage || 'unknown'} pass · {event.triage?.action_type || 'dismiss'}</p>
+                </div>
+                <span className="text-[11px] text-slate-500">{event.sensor_data?.occurred_at || ''}</span>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-4 border-t border-slate-800 pt-6">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Session metrics</h3>
+          <p className="mt-1 text-xs text-slate-500">In-memory counts reset when the backend restarts. Visit avoidance is an estimate based on event outcomes; false-alarm rate uses submitted ticket feedback only.</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
+          {metricItems.map(([label, value, color]) => (
+            <div key={label} className="border-l border-slate-700 pl-3 py-1">
+              <span className="block text-[10px] uppercase text-slate-500">{label}</span>
+              <strong className={`mt-1 block text-xl font-semibold ${color}`}>{value}</strong>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="space-y-4 border-t border-slate-800 pt-6">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Suggested baseline changes</h3>
+          <p className="mt-1 text-xs text-slate-500">Repeated false-alarm feedback creates suggestions only. A human must apply each change.</p>
+        </div>
+        {baselineSuggestions.length === 0 ? (
+          <p className="text-sm text-slate-500">No baseline suggestions yet.</p>
+        ) : (
+          <div className="divide-y divide-slate-800 border-y border-slate-800">
+            {baselineSuggestions.map((suggestion) => (
+              <div key={`${suggestion.subject_id}:${suggestion.field}`} className="flex flex-wrap items-center justify-between gap-4 py-4">
+                <div>
+                  <p className="text-sm font-medium text-slate-200">{suggestion.field} · {suggestion.subject_id}</p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {String(suggestion.current_value)} → {String(suggestion.suggested_value)} · {suggestion.false_alarm_count} false-alarm reports
+                  </p>
+                </div>
+                {suggestion.status === 'pending_review' ? (
+                  <button
+                    onClick={() => onApplyBaselineSuggestion(suggestion)}
+                    className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs font-semibold text-amber-200"
+                  >
+                    Apply suggestion
+                  </button>
+                ) : (
+                  <span className="text-xs text-emerald-300">Applied</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function BuddyView({ buddies, requests, subjectId, onRequest }) {
+  const residentRequests = requests.filter((request) => request.subject_id === subjectId)
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-8">
+      <section className="border-b border-slate-800 pb-5">
+        <h3 className="text-sm font-semibold text-white">Friendly conversation</h3>
+        <p className="mt-1 text-xs text-slate-400">
+          Synthetic demo companions for a friendly chat. This is not therapy or crisis support. Requests are recorded locally; nobody is contacted.
+        </p>
+        <p className="mt-2 text-[11px] text-slate-500">Resident: {subjectId}</p>
+      </section>
+
+      <section className="divide-y divide-slate-800 border-y border-slate-800">
+        {buddies.map((buddy) => (
+          <article key={buddy.buddy_id} className="flex flex-wrap items-center justify-between gap-4 py-5">
+            <div className="flex min-w-0 items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-500/20 bg-cyan-950/30 text-cyan-200">
+                <MessageCircle className="h-4 w-4" />
+              </div>
+              <div>
+                <h4 className="text-sm font-medium text-slate-100">{buddy.name}</h4>
+                <dl className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-xs">
+                  <div className="flex gap-1.5">
+                    <dt className="text-slate-500">Relationship:</dt>
+                    <dd className="text-slate-200">{buddy.relationship || 'Not specified'}</dd>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <dt className="text-slate-500">Task NDA:</dt>
+                    <dd className={buddy.nda_signed === true ? 'text-emerald-300' : 'text-amber-300'}>
+                      {buddy.nda_signed === true ? 'Signed (demo)' : 'Not signed (demo)'}
+                    </dd>
+                  </div>
+                </dl>
+                <p className="mt-1 text-xs text-slate-400">{buddy.description}</p>
+                <span className="mt-2 inline-block text-[10px] uppercase text-slate-500">
+                  Synthetic · {buddy.language}
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={() => onRequest(buddy.buddy_id)}
+              className="rounded-lg border border-cyan-500/30 bg-cyan-950/20 px-3 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/30"
+            >
+              Request a chat
+            </button>
+          </article>
+        ))}
+      </section>
+
+      <section className="space-y-3">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Recent demo requests</h3>
+          <p className="mt-1 text-xs text-slate-500">These entries are local test records only.</p>
+        </div>
+        {residentRequests.length === 0 ? (
+          <p className="text-xs text-slate-500">No requests recorded for this resident.</p>
+        ) : (
+          <div className="divide-y divide-slate-800 border-y border-slate-800">
+            {residentRequests.slice().reverse().map((request) => (
+              <div key={request.request_id} className="flex flex-wrap justify-between gap-2 py-3 text-xs">
+                <span className="text-slate-300">{request.buddy_name} · {request.status.replaceAll('_', ' ')}</span>
+                <span className="text-slate-500">{request.created_at}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   )
 }

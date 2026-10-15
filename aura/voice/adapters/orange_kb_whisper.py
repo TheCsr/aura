@@ -25,7 +25,8 @@ class OrangeKbWhisperAdapter:
         timeout: tuple[int, int] = (15, 60),
     ) -> None:
         self._api_key = (api_key or os.environ.get("ORANGE_API_KEY", "")).strip()
-        self._base_url = (base_url or os.environ.get("KB_WHISPER_URL", DEFAULT_BASE_URL)).strip().rstrip("/")
+        configured_url = os.environ.get("KB_WHISPER_URL") or os.environ.get("BSER_URL") or DEFAULT_BASE_URL
+        self._base_url = (base_url or configured_url).strip().rstrip("/")
         self._model = (model or os.environ.get("KB_WHISPER_MODEL", DEFAULT_MODEL)).strip()
         self._timeout = timeout
 
@@ -67,8 +68,8 @@ class OrangeKbWhisperAdapter:
             )
             response.raise_for_status()
             payload = response.json()
-            text = payload.get("text", "")
-            if not isinstance(text, str):
+            text = payload.get("text", "") if isinstance(payload, dict) else None
+            if not isinstance(text, str) or not text.strip():
                 raise ValueError("Transcription API response did not contain a valid 'text' string")
 
             return Transcript(
@@ -77,6 +78,5 @@ class OrangeKbWhisperAdapter:
                 language=language,
                 model=self._model,
             )
-        except requests.RequestException as error:
-            logger.error("KB-Whisper request failed: %s", error)
-            raise RuntimeError(f"KB-Whisper transcription request failed: {error}") from error
+        except requests.RequestException:
+            raise RuntimeError("KB-Whisper request failed; please retry the recording") from None
